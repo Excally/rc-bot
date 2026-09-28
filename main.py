@@ -1,16 +1,14 @@
 import os
-import sys
+import re
 import glob
 import time
-import math
-import random
-import shutil
-import ctypes
+import sys
 import subprocess
+import shutil
 import cv2
 import numpy as np
 
-# ==============================================================================
+# ================================================================================
 # CONFIGURATION
 # ==============================================================================
 # Target mob name to hunt
@@ -31,19 +29,17 @@ TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templat
 # Show small preview window (press 'q' in preview window to quit)
 SHOW_PREVIEW = False
 
-# Minimap Travel (Open minimap to travel when no mobs in vision)
+# Minimap registration travel. The reference image remains read-only; travel
+# is allowed only after the visible map registers to it with clear confidence.
 ENABLE_MINIMAP_WALK = True
-MINIMAP_IDLE_DELAY = 1.0     # Seconds with no visible mobs before opening minimap
-MINIMAP_COOLDOWN = 3.5       # Minimum seconds between minimap travels (lets character walk)
-MINIMAP_WALK_MIN_DIST = 160  # Min travel distance from player (pixels, avoids micro-steps)
-MINIMAP_WALK_MAX_DIST = 420  # Max travel distance from player (pixels, keeps within safe zone)
-
-# Periodic Ground Walking / Patrol (Fallback if minimap travel is disabled)
-ENABLE_WANDER = False
-WANDER_IDLE_DELAY = 1.0      # Seconds with no visible mobs before taking a step
-WANDER_COOLDOWN = 1.6        # Minimum seconds between wander steps
-WANDER_RADIUS_MIN = 160      # Min distance from player (pixels, safely outside player deadzone)
-WANDER_RADIUS_MAX = 340      # Max distance from player (larger area for exploration, still 100% safe from UI)
+MINIMAP_IDLE_DELAY = 0.9
+MINIMAP_COOLDOWN = 3.0
+MINIMAP_SAFE_VIEW_FRACTION = 0.70
+MINIMAP_MIN_CLICK_DISTANCE = 100
+MINIMAP_MAX_CLICK_DISTANCE = 260
+MINIMAP_ALIGN_MIN_SCORE = 0.45
+MINIMAP_ALIGN_MIN_GAP = 0.025
+MINIMAP_GEOMETRY_MIN_SCORE = 0.40
 
 # Safety margins (fraction of game canvas) to exclude UI elements
 MARGIN_TOP = 0.12
@@ -60,17 +56,92 @@ PLAYER_DEADZONE_RADIUS = 60
 
 # Template matching minimum score
 MATCH_THRESHOLD = 0.55
+TARGET_SCAN_WIDTH = 1100
+UI_MATCH_THRESHOLD = 0.68
+BACK_ICON_CENTER = (1546, 44)
+BACK_ICON_SCALES = (0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 1.0)
+WHITE_TEXT_MIN_CHANNEL = 190
+WHITE_TEXT_MAX_CHANNEL_SPREAD = 50
 
 # How long (seconds) to wait for red target square after clicking mob (gives time to walk/lock)
 TARGET_LOCK_TIMEOUT = 2.5
 
 # Grace period (seconds) before confirming mob is defeated when red square drops (prevents flicker drops)
-TARGET_DEFEATED_GRACE_TIME = 0.8
+TARGET_DEFEATED_GRACE_TIME = 0.70
+EXHAUSTED_MOB_BLACKLIST_SECONDS = 600.0
+REPEATED_OUTPUT_LIMIT = 20
 # ==============================================================================
 
-
-
 # ==============================================================================
+class RepeatedOutputReset(Exception):
+    def __init__(self, pattern):
+        super().__init__(pattern)
+        self.pattern = pattern
+
+class RepeatedOutputGuard:
+    """Request one engine reset when the same warning/status pattern loops."""
+    def __init__(self, limit=REPEATED_OUTPUT_LIMIT):
+        self.limit = limit
+        self.counts = {}
+
+    def observe(self, message):
+        line = message.strip()
+        if not line:
+            return
+        if line.startswith((
+            "[+] Red square gone", "[+] Back action closed",
+            "[+] System Back closed", "[+] Screen capture recovered",
+            "[*] Target locked", "[*] Detected active target lock",
+        )):
+            self.counts.clear()
+            return
+
+        watch = line.startswith(("[!]", "[-]", "[...]"))
+        if line.startswith("[~]"):
+            lower_line = line.lower()
+            watch = any(word in lower_line for word in (
+                "failed", "skipped", "still", "unavailable", "could not", "retry",
+            ))
+        if not watch:
+            return
+
+        pattern = re.sub(r"\d+(?:\.\d+)?", "<n>", line)
+        pattern = re.sub(r"\s+", " ", pattern)
+        self.counts[pattern] = self.counts.get(pattern, 0) + 1
+        if self.counts[pattern] >= self.limit:
+            self.counts.clear()
+            raise RepeatedOutputReset(pattern)
+
+class TimestampedOutputStream:
+    """Prefix each console line while passing raw lines to the loop watchdog."""
+    def __init__(self, stream, guard=None):
+        self.stream = stream
+        self.guard = guard
+        self.pending = ""
+
+    def _write_line(self, line, ending):
+        raw_line = line.rstrip("\r")
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        self.stream.write(f"[{timestamp}] {raw_line}{ending}")
+        if self.guard is not None:
+            self.guard.observe(raw_line)
+
+    def write(self, text):
+        self.pending += text
+        while "\n" in self.pending:
+            line, self.pending = self.pending.split("\n", 1)
+            self._write_line(line, "\n")
+        return len(text)
+
+    def flush(self):
+        if self.pending:
+            pending, self.pending = self.pending, ""
+            self._write_line(pending, "")
+        return self.stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
 # ADB ENGINE (TRUE BACKGROUND HUNTING)
 # ==============================================================================
 
@@ -119,7 +190,6 @@ def get_bluestacks_adb_info():
 
     return adb_path, port or 5555
 
-
 def init_adb():
     """Connect to MSI App Player via ADB for background capture and input."""
     adb_path, port = get_bluestacks_adb_info()
@@ -152,7 +222,6 @@ def init_adb():
 
     return None, None
 
-
 def adb_capture(adb_path, device_serial):
     """
     Capture the game screen directly from Android framebuffer.
@@ -171,22 +240,26 @@ def adb_capture(adb_path, device_serial):
     except Exception:
         return None
 
-
-def adb_click(adb_path, device_serial, x, y):
-    """
-    Send tap to Android via ADB.
-    Non-blocking: DOES NOT touch the Windows mouse cursor at all!
-    """
+def adb_click(adb_path, device_serial, x, y, synchronous=False):
+    """Send an ADB tap, optionally waiting for injection to finish."""
+    command = [
+        adb_path, "-s", device_serial, "shell", "input", "tap",
+        str(int(x)), str(int(y)),
+    ]
     try:
-        subprocess.Popen(
-            [adb_path, "-s", device_serial, "shell", "input", "tap", str(int(x)), str(int(y))],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
+        if synchronous:
+            result = subprocess.run(
+                command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0,
+            )
+            if result.returncode != 0:
+                print(f"[!] ADB tap failed at ({int(x)}, {int(y)}), exit code {result.returncode}.")
+                return False
+        else:
+            subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
-    except Exception:
+    except Exception as e:
+        print(f"[!] ADB tap failed at ({int(x)}, {int(y)}): {e}")
         return False
-
 
 # ==============================================================================
 # WIN32 FALLBACK ENGINE
@@ -234,7 +307,6 @@ def find_window_by_title(title):
 
     raise Exception(f"Window '{title}' not found!")
 
-
 def find_game_child(parent_hwnd):
     """Find BlueStacksApp child window inside MSI App Player."""
     import win32gui
@@ -255,7 +327,6 @@ def find_game_child(parent_hwnd):
 
     return parent_hwnd
 
-
 def win32_capture(hwnd):
     """Win32 mss fallback screen capture."""
     import win32gui
@@ -271,7 +342,6 @@ def win32_capture(hwnd):
     with MSS() as sct:
         shot = np.array(sct.grab(region))
     return cv2.cvtColor(shot, cv2.COLOR_BGRA2BGR)
-
 
 def win32_click(hwnd, x, y):
     """Safely click on window via Win32 cursor with error handling."""
@@ -299,30 +369,823 @@ def win32_click(hwnd, x, y):
     except Exception as e:
         print(f"[!] Win32 click error: {e}")
 
+def capture_screen(adb_path, device_serial, game_hwnd, use_adb):
+    return adb_capture(adb_path, device_serial) if use_adb else win32_capture(game_hwnd)
+
+def send_click(adb_path, device_serial, game_hwnd, use_adb, x, y, synchronous=False):
+    if use_adb:
+        return adb_click(adb_path, device_serial, x, y, synchronous=synchronous)
+    win32_click(game_hwnd, x, y)
+    return True
 
 # ==============================================================================
 # VISION & HUNTING LOGIC
 # ==============================================================================
 
 def load_templates():
-    """Load nametag templates from disk."""
+    """Load only templates used by combat targeting and UI recovery."""
+    required = {
+        "zombie_lv65",
+        "zombie",
+        "purple_name_zombie_lv65",
+        "minimapicon",
+        "backicon",
+        "minimap-zombie-layout",
+        "pickup-available",
+        "pickup-not-yet",
+        "exhausted-caption",
+    }
     templates = {}
     if os.path.exists(TEMPLATE_DIR):
         for f in os.listdir(TEMPLATE_DIR):
             if f.lower().endswith((".png", ".jpg")):
                 name = os.path.splitext(f)[0]
+                if name not in required:
+                    continue
                 img = cv2.imread(os.path.join(TEMPLATE_DIR, f))
                 if img is not None:
                     templates[name] = img
     return templates
 
+def find_exhausted_caption(frame, template):
+    """Detect the template's red banner using its color, aspect, and density."""
+    if frame is None or template is None:
+        return False
 
-def find_target_mobs(frame, template, center_x, center_y, threshold=MATCH_THRESHOLD, blacklist=None, curr_time=0.0):
+    fh, fw = frame.shape[:2]
+    screen_scale = fw / 1600.0
+    cached = getattr(find_exhausted_caption, "_template_cache", None)
+    if cached is None or cached[0] is not template:
+        template_hsv = cv2.cvtColor(template, cv2.COLOR_BGR2HSV)
+        hue = template_hsv[:, :, 0]
+        template_mask = (
+            ((hue <= 10) | (hue >= 170)) &
+            (template_hsv[:, :, 1] >= 110) &
+            (template_hsv[:, :, 2] >= 90)
+        ).astype(np.uint8) * 255
+        points = cv2.findNonZero(template_mask)
+        if points is None:
+            return False
+        _, _, template_w, template_h = cv2.boundingRect(points)
+        density = cv2.countNonZero(template_mask) / (template_w * template_h)
+        cached = (template, template_w, template_h, density)
+        find_exhausted_caption._template_cache = cached
+
+    template_w, template_h, density = cached[1:]
+    x0, x1 = int(fw * 0.12), int(fw * 0.88)
+    y1 = int(fh * 0.50)
+    region = frame[:y1, x0:x1]
+    processing_scale = min(0.5, 800.0 / max(1, region.shape[1]))
+    frame_hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+    hue = frame_hsv[:, :, 0]
+    red_mask = (
+        ((hue <= 10) | (hue >= 170)) &
+        (frame_hsv[:, :, 1] >= 110) &
+        (frame_hsv[:, :, 2] >= 90)
+    ).astype(np.uint8) * 255
+    if processing_scale < 1.0:
+        red_mask = cv2.resize(
+            red_mask, None, fx=processing_scale, fy=processing_scale,
+            interpolation=cv2.INTER_NEAREST,
+        )
+    close_width = max(5, int(round(15 * screen_scale * processing_scale)))
+    joined = cv2.morphologyEx(
+        red_mask, cv2.MORPH_CLOSE, np.ones((3, close_width), dtype=np.uint8)
+    )
+    count, _, stats, _ = cv2.connectedComponentsWithStats(joined, 8)
+    expected_w = template_w * screen_scale * processing_scale
+    expected_h = template_h * screen_scale * processing_scale
+    min_w, max_w = expected_w * 0.50, expected_w * 1.20
+    min_h, max_h = expected_h * 0.45, expected_h * 1.50
+    min_aspect, max_aspect = (template_w / template_h) * 0.55, (template_w / template_h) * 1.70
+    min_density, max_density = density * 0.45, min(0.78, density * 1.80)
+
+    for x, y, width, height, _ in stats[1:count]:
+        if not (min_w <= width <= max_w and min_h <= height <= max_h):
+            continue
+        aspect = width / max(1, height)
+        if not (min_aspect <= aspect <= max_aspect):
+            continue
+        red_pixels = cv2.countNonZero(red_mask[y:y + height, x:x + width])
+        region_density = red_pixels / (width * height)
+        if min_density <= region_density <= max_density:
+            return True
+    return False
+
+def find_fixed_ui_icon(frame, icon, expected_center, threshold=UI_MATCH_THRESHOLD, search_radius=(90, 70), scale_adjustments=(0.75, 0.8, 0.85, 0.9, 1.0, 1.1)):
+    """Match a fixed UI icon near its known screen position."""
+    if frame is None or icon is None:
+        return None
+
+    fh, fw = frame.shape[:2]
+    sx, sy = fw / 1600.0, fh / 900.0
+    center_x, center_y = int(expected_center[0] * sx), int(expected_center[1] * sy)
+    radius_x, radius_y = int(search_radius[0] * sx), int(search_radius[1] * sy)
+    best_score, best_center = -1.0, None
+
+    # Game UI icons can be rendered smaller than their saved templates at
+    # different emulator UI scales, even when their screen position is fixed.
+    for scale_adjustment in scale_adjustments:
+        scale = sx * scale_adjustment
+        scaled = cv2.resize(icon, None, fx=scale, fy=scale)
+        ih, iw = scaled.shape[:2]
+        if ih >= fh or iw >= fw:
+            continue
+
+        left = max(0, center_x - radius_x - iw // 2)
+        top = max(0, center_y - radius_y - ih // 2)
+        right = min(fw, center_x + radius_x + iw // 2)
+        bottom = min(fh, center_y + radius_y + ih // 2)
+        region = frame[top:bottom, left:right]
+        if region.shape[0] < ih or region.shape[1] < iw:
+            continue
+
+        result = cv2.matchTemplate(region, scaled, cv2.TM_CCOEFF_NORMED)
+        _, score, _, location = cv2.minMaxLoc(result)
+        if score > best_score:
+            best_score = score
+            best_center = (left + location[0] + iw // 2, top + location[1] + ih // 2)
+
+    return best_center if best_score >= threshold else None
+
+def find_back_icon(frame, templates):
+    return find_fixed_ui_icon(
+        frame, templates.get("backicon"), BACK_ICON_CENTER,
+        threshold=0.40, search_radius=(35, 30),
+        scale_adjustments=BACK_ICON_SCALES,
+    )
+
+def detect_game_ui(frame, templates):
+    """Recognize the map panel before combat, then treat other panels separately."""
+    if is_disconnected_screen(frame):
+        return "disconnected", None
+    back = find_back_icon(frame, templates)
+    if back is not None:
+        return "minimap", back
+    map_button = find_fixed_ui_icon(frame, templates.get("minimapicon"), (1150, 50))
+    if map_button is not None:
+        return "combat", map_button
+    return "other", None
+
+def tap_back_icon_and_confirm(adb_path, device_serial, game_hwnd, use_adb, back, back_icon):
+    """Tap Back once, allow the UI to react, then use system Back if needed."""
+    tapped = send_click(
+        adb_path, device_serial, game_hwnd, use_adb, *back, synchronous=True
+    )
+    if not tapped:
+        print("[!] Back-icon tap failed; trying the system Back action.")
+    else:
+        time.sleep(0.35)
+        frame = capture_screen(adb_path, device_serial, game_hwnd, use_adb)
+        if frame is None:
+            print("[!] Could not verify the panel closed after tapping Back.")
+            return False
+        if back_icon is None:
+            print("[!] Back icon template is unavailable; panel closure could not be verified.")
+            return False
+        if find_fixed_ui_icon(
+            frame, back_icon, BACK_ICON_CENTER, threshold=0.40,
+            search_radius=(35, 30), scale_adjustments=BACK_ICON_SCALES,
+        ) is None:
+            return True
+        print("[!] Back icon remains visible; trying the system Back action.")
+
+    press_ui_back(adb_path, device_serial, game_hwnd, use_adb)
+    time.sleep(0.35)
+    frame = capture_screen(adb_path, device_serial, game_hwnd, use_adb)
+    if frame is not None and back_icon is not None and find_fixed_ui_icon(
+        frame, back_icon, BACK_ICON_CENTER, threshold=0.40,
+        search_radius=(35, 30), scale_adjustments=BACK_ICON_SCALES,
+    ) is None:
+        return True
+
+    print("[!] Panel is still open after Back-icon and system Back attempts.")
+    return False
+
+def fail_minimap_travel(adb_path, device_serial, game_hwnd, use_adb, back, templates, message):
+    print(message)
+    tap_back_icon_and_confirm(
+        adb_path, device_serial, game_hwnd, use_adb,
+        back, templates.get("backicon"),
+    )
+    return False
+
+def minimap_white_mask(image):
+    """Extract bright map geometry while ignoring colored game objects."""
+    channels = image.astype(np.int16)
+    spread = channels.max(axis=2) - channels.min(axis=2)
+    return (
+        (channels.min(axis=2) >= 220) &
+        (spread <= 35)
+    ).astype(np.uint8) * 255
+
+def build_minimap_safe_mask(reference):
+    """Build an interior floor mask from the immutable full-map reference."""
+    walls = minimap_white_mask(reference)
+    contours, hierarchy = cv2.findContours(walls, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return np.zeros(walls.shape, dtype=np.uint8)
+
+    outer_index = max(range(len(contours)), key=lambda index: cv2.contourArea(contours[index]))
+    outer_x, outer_y, outer_w, outer_h = cv2.boundingRect(contours[outer_index])
+    margin = max(30, int(round(min(reference.shape[:2]) * 0.035)))
+
+    safe = np.zeros(walls.shape, dtype=np.uint8)
+    x1 = outer_x + margin
+    y1 = outer_y + margin
+    x2 = outer_x + outer_w - margin
+    y2 = outer_y + outer_h - margin
+    if x2 <= x1 or y2 <= y1:
+        return safe
+    safe[y1:y2, x1:x2] = 255
+
+    blocked = walls.copy()
+    # The large outlined rectangles are obstacles. Fill their enclosed holes
+    # so the selector cannot click inside a tomb or similar structure.
+    if hierarchy is not None:
+        for index, contour in enumerate(contours):
+            parent = int(hierarchy[0][index][3])
+            if parent < 0:
+                continue
+            if cv2.contourArea(contour) < 1000:
+                continue
+            if cv2.contourArea(contours[parent]) < 5000:
+                continue
+            cv2.drawContours(blocked, [contour], -1, 255, thickness=-1)
+
+    blocked = cv2.dilate(blocked, np.ones((9, 9), np.uint8), iterations=1)
+    safe[blocked > 0] = 0
+    safe = cv2.erode(safe, np.ones((5, 5), np.uint8), iterations=1)
+    return safe
+
+def build_minimap_waypoints(safe_mask, grid_step=120):
+    """Build a deterministic serpentine route over the complete safe map."""
+    if safe_mask is None or safe_mask.size == 0:
+        return []
+
+    height, width = safe_mask.shape[:2]
+    waypoints = []
+    radius = max(12, grid_step // 3)
+    half_step = max(1, grid_step // 2)
+
+    # Snap every grid cell to its nearest safe pixel. This keeps the route
+    # inside the reference while still covering rooms around walls/obstacles.
+    for row, y in enumerate(range(half_step, height, grid_step)):
+        row_points = []
+        for x in range(half_step, width, grid_step):
+            x1 = max(0, x - radius)
+            y1 = max(0, y - radius)
+            x2 = min(width, x + radius + 1)
+            y2 = min(height, y + radius + 1)
+            local = safe_mask[y1:y2, x1:x2]
+            local_y, local_x = np.where(local > 0)
+            if len(local_x) == 0:
+                continue
+            distances = (local_x + x1 - x) ** 2 + (local_y + y1 - y) ** 2
+            nearest = int(np.argmin(distances))
+            row_points.append((int(local_x[nearest] + x1), int(local_y[nearest] + y1)))
+
+        # Alternating rows make the route sweep the map instead of repeatedly
+        # returning to one side after each horizontal pass.
+        if row % 2:
+            row_points.reverse()
+        for point in row_points:
+            if not waypoints or point != waypoints[-1]:
+                waypoints.append(point)
+
+    return waypoints
+
+def _minimap_geometry_score(frame_mask, scaled_reference, origin):
+    """Score a proposed reference placement using overlap in both directions."""
+    fh, fw = frame_mask.shape[:2]
+    sh, sw = scaled_reference.shape[:2]
+    ox, oy = origin
+    x1, y1 = max(0, ox), max(0, oy)
+    x2, y2 = min(fw, ox + sw), min(fh, oy + sh)
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+
+    expected = (scaled_reference[y1 - oy:y2 - oy, x1 - ox:x2 - ox] > 0).astype(np.uint8)
+    observed = (frame_mask[y1:y2, x1:x2] > 0).astype(np.uint8)
+    if cv2.countNonZero(expected) < 3000 or cv2.countNonZero(observed) < 3000:
+        return 0.0
+
+    kernel = np.ones((7, 7), np.uint8)
+    expected_near = cv2.dilate(expected, kernel, iterations=1) > 0
+    observed_near = cv2.dilate(observed, kernel, iterations=1) > 0
+    recall = float(np.count_nonzero(expected & observed_near)) / max(1, np.count_nonzero(expected))
+    precision = float(np.count_nonzero(observed & expected_near)) / max(1, np.count_nonzero(observed))
+    if recall + precision == 0:
+        return 0.0
+    return 2.0 * recall * precision / (recall + precision)
+
+
+def _refine_minimap_y(frame_mask, scaled_reference, origin):
+    """Correct repeated-row ambiguity by optimizing the vertical placement."""
+    ox, oy = origin
+    coarse = []
+    for offset in range(-360, 361, 16):
+        candidate_y = oy + offset
+        coarse.append((
+            _minimap_geometry_score(frame_mask, scaled_reference, (ox, candidate_y)),
+            candidate_y,
+        ))
+    _, coarse_y = max(coarse)
+
+    fine = []
+    for candidate_y in range(coarse_y - 16, coarse_y + 17, 2):
+        fine.append((
+            _minimap_geometry_score(frame_mask, scaled_reference, (ox, candidate_y)),
+            candidate_y,
+        ))
+    geometry, refined_y = max(fine)
+    return (ox, refined_y), geometry
+
+
+def align_minimap_to_reference(frame, reference):
+    """Register a partial transparent minimap to the full reference image."""
+    if frame is None or reference is None:
+        return None
+
+    frame_mask = minimap_white_mask(frame)
+    if cv2.countNonZero(frame_mask) < 12000:
+        return None
+
+    # Downsampling makes the one-time travel registration inexpensive while
+    # preserving the large walls and repeated room rectangles.
+    downsample = 0.25
+    search_frame = cv2.resize(
+        frame_mask, None, fx=downsample, fy=downsample,
+        interpolation=cv2.INTER_NEAREST,
+    )
+    reference_mask = minimap_white_mask(reference)
+    raw_candidates = []
+    patch_w = min(180, search_frame.shape[1] - 4)
+    patch_h = min(180, search_frame.shape[0] - 4)
+    if patch_w < 120 or patch_h < 120:
+        return None
+
+    scales = (0.92, 0.96, 1.0, 1.04, 1.08)
+    for scale in scales:
+        scaled = cv2.resize(
+            reference_mask, None, fx=scale * downsample, fy=scale * downsample,
+            interpolation=cv2.INTER_NEAREST,
+        )
+        scaled_h, scaled_w = scaled.shape[:2]
+        if scaled_w < patch_w or scaled_h < patch_h:
+            continue
+
+        x_starts = sorted(set((
+            0,
+            max(0, (scaled_w - patch_w) // 2),
+            max(0, scaled_w - patch_w),
+        )))
+        y_remaining = max(0, scaled_h - patch_h)
+        y_starts = sorted(set(
+            int(round(y_remaining * fraction))
+            for fraction in (0.0, 0.5, 1.0)
+        ))
+        for crop_y in y_starts:
+            for crop_x in x_starts:
+                patch = scaled[crop_y:crop_y + patch_h, crop_x:crop_x + patch_w]
+                if cv2.countNonZero(patch) < 3000:
+                    continue
+                result = cv2.matchTemplate(
+                    search_frame, patch, cv2.TM_CCOEFF_NORMED
+                )
+                _, score, _, location = cv2.minMaxLoc(result)
+                origin = (
+                    int(round((location[0] - crop_x) / downsample)),
+                    int(round((location[1] - crop_y) / downsample)),
+                )
+                raw_candidates.append((float(score), float(scale), origin))
+
+    if not raw_candidates:
+        return None
+
+    raw_candidates.sort(key=lambda candidate: candidate[0], reverse=True)
+    candidates = []
+    for candidate in raw_candidates:
+        score, scale, origin = candidate
+        if any(
+            abs(origin[0] - kept[2][0]) <= 10 and
+            abs(origin[1] - kept[2][1]) <= 10 and
+            abs(scale - kept[1]) <= 0.035
+            for kept in candidates
+        ):
+            continue
+        scaled_reference = cv2.resize(
+            reference_mask, None, fx=scale, fy=scale,
+            interpolation=cv2.INTER_NEAREST,
+        )
+        geometry = _minimap_geometry_score(frame_mask, scaled_reference, origin)
+        if geometry > 0:
+            candidates.append((score, scale, origin, geometry))
+            if len(candidates) >= 8:
+                break
+    if not candidates:
+        return None
+    # Repeated rooms and rows can make a local template patch look excellent
+    # at the wrong vertical offset. Full visible geometry is the authority.
+    candidates.sort(key=lambda candidate: (candidate[3], candidate[0]), reverse=True)
+    best = candidates[0]
+    second_geometry = candidates[1][3] if len(candidates) > 1 else 0.0
+    score, scale, origin, geometry = best
+    scaled_reference = cv2.resize(
+        reference_mask, None, fx=scale, fy=scale,
+        interpolation=cv2.INTER_NEAREST,
+    )
+    origin, geometry = _refine_minimap_y(frame_mask, scaled_reference, origin)
+    gap = geometry - second_geometry
+    if (
+        score < MINIMAP_ALIGN_MIN_SCORE or
+        geometry < MINIMAP_GEOMETRY_MIN_SCORE or
+        gap < MINIMAP_ALIGN_MIN_GAP
+    ):
+        return {
+            "valid": False,
+            "score": score,
+            "geometry": geometry,
+            "gap": gap,
+            "scale": scale,
+            "origin": origin,
+        }
+
+    return {
+        "valid": True,
+        "score": score,
+        "geometry": geometry,
+        "gap": gap,
+        "scale": scale,
+        "origin": origin,
+    }
+
+def find_minimap_player(frame):
+    """Find the fixed 20px cyan player marker on the open map."""
+    if frame is None:
+        return None
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    marker = (
+        (hsv[:, :, 0] >= 85) & (hsv[:, :, 0] <= 115) &
+        (hsv[:, :, 1] >= 120) & (hsv[:, :, 2] >= 100)
+    ).astype(np.uint8)
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(marker, 8)
+    fh, fw = frame.shape[:2]
+    center = np.array([fw / 2.0, fh / 2.0])
+    choices = []
+    for index in range(1, count):
+        x, y, w, h, area = stats[index]
+        if not (200 <= area <= 3000 and 14 <= w <= 100 and 14 <= h <= 100):
+            continue
+        point = centroids[index]
+        distance = float(np.linalg.norm(point - center))
+        if distance > min(fw, fh) * 0.18:
+            continue
+        choices.append((distance, (int(round(point[0])), int(round(point[1])))))
+    if not choices:
+        return None
+    choices.sort(key=lambda choice: choice[0])
+    return choices[0][1]
+
+def choose_minimap_destination(frame, alignment, safe_mask, player_screen, waypoints=None):
+    """Choose a visible point that advances through the full-map route."""
+    if not alignment or not alignment.get("valid") or safe_mask is None or player_screen is None:
+        return None
+
+    if waypoints is None:
+        waypoints = build_minimap_waypoints(safe_mask)
+    if not waypoints:
+        return None
+
+    scale = alignment["scale"]
+    ox, oy = alignment["origin"]
+    player_x, player_y = player_screen
+    map_x = (player_x - ox) / scale
+    map_y = (player_y - oy) / scale
+    ref_h, ref_w = safe_mask.shape[:2]
+    if not (0 <= map_x < ref_w and 0 <= map_y < ref_h and safe_mask[int(map_y), int(map_x)] > 0):
+        return None
+
+    step = 8
+    ys, xs = np.where(safe_mask[::step, ::step] > 0)
+    if len(xs) == 0:
+        return None
+    ref_xs = xs * step + step // 2
+    ref_ys = ys * step + step // 2
+    screen_xs = ox + ref_xs * scale
+    screen_ys = oy + ref_ys * scale
+    fh, fw = frame.shape[:2]
+    margin_x = fw * (1.0 - MINIMAP_SAFE_VIEW_FRACTION) / 2.0
+    margin_y = fh * (1.0 - MINIMAP_SAFE_VIEW_FRACTION) / 2.0
+    visible = (
+        (screen_xs >= margin_x) & (screen_xs <= fw - margin_x) &
+        (screen_ys >= margin_y) & (screen_ys <= fh - margin_y)
+    )
+    distances = np.hypot(screen_xs - player_x, screen_ys - player_y)
+    visible &= (
+        distances >= MINIMAP_MIN_CLICK_DISTANCE * fw / 1600.0
+    ) & (
+        distances <= MINIMAP_MAX_CLICK_DISTANCE * fw / 1600.0
+    )
+    if not np.any(visible):
+        return None
+
+    route_signature = (
+        safe_mask.shape,
+        len(waypoints),
+        waypoints[0],
+        waypoints[-1],
+    )
+    route = getattr(choose_minimap_destination, "route", None)
+    if route is None or route["signature"] != route_signature:
+        # Start at the nearest route point, then move to the next point. This
+        # avoids forcing a newly started bot to cross the whole map first.
+        waypoint_array = np.asarray(waypoints, dtype=np.float32)
+        nearest_index = int(np.argmin(
+            np.hypot(waypoint_array[:, 0] - map_x, waypoint_array[:, 1] - map_y)
+        ))
+        route = {
+            "signature": route_signature,
+            "waypoints": tuple(waypoints),
+            "index": nearest_index,
+        }
+        choose_minimap_destination.route = route
+
+    waypoint_array = np.asarray(route["waypoints"], dtype=np.float32)
+    current_index = int(route["index"])
+    target_index = (current_index + 1) % len(waypoint_array)
+    target_x, target_y = waypoint_array[target_index]
+    distance_to_target = float(np.hypot(target_x - map_x, target_y - map_y))
+    if distance_to_target < max(70.0, MINIMAP_MIN_CLICK_DISTANCE / max(scale, 0.1)):
+        current_index = target_index
+        route["index"] = current_index
+        target_index = (current_index + 1) % len(waypoint_array)
+        target_x, target_y = waypoint_array[target_index]
+
+    # A target may be outside the partial minimap. Choose the visible safe
+    # point that makes the most progress toward it, with a stable distance tie
+    # breaker so the same frame produces the same click.
+    candidate_ref_xs = (screen_xs - ox) / scale
+    candidate_ref_ys = (screen_ys - oy) / scale
+    before = np.hypot(target_x - map_x, target_y - map_y)
+    after = np.hypot(target_x - candidate_ref_xs, target_y - candidate_ref_ys)
+    progress = before - after
+    preferred_distance = (
+        MINIMAP_MIN_CLICK_DISTANCE + MINIMAP_MAX_CLICK_DISTANCE
+    ) * 0.5 * fw / 1600.0
+    score = progress * 1000.0 - np.abs(distances - preferred_distance)
+    score[~visible] = -np.inf
+    index = int(np.argmax(score))
+    choose_minimap_destination.last_route_target = (
+        int(round(target_x)), int(round(target_y))
+    )
+    return int(round(screen_xs[index])), int(round(screen_ys[index]))
+
+def travel_via_minimap(adb_path, device_serial, game_hwnd, use_adb, templates):
+    """Register the visible minimap, click one safe nearby waypoint, and close it."""
+    reference = templates.get("minimap-zombie-layout")
+    if reference is None:
+        print("[!] Minimap travel disabled: full reference map is missing.")
+        return False
+
+    map_frame = capture_screen(adb_path, device_serial, game_hwnd, use_adb)
+    if map_frame is None:
+        return False
+
+    state, icon_position = detect_game_ui(map_frame, templates)
+    if state == "combat":
+        target_template = templates.get("zombie_lv65")
+        if target_template is None:
+            target_template = templates.get("zombie")
+        visible_targets = []
+        if target_template is not None:
+            visible_targets.append((target_template, "white"))
+        purple_template = templates.get("purple_name_zombie_lv65")
+        if purple_template is not None:
+            visible_targets.append((purple_template, "purple"))
+        fh, fw = map_frame.shape[:2]
+        if has_red_square(map_frame)[0] or find_target_mobs(
+            map_frame, visible_targets, fw // 2, fh // 2, MATCH_THRESHOLD
+        ):
+            print("[~] Minimap travel skipped: a target appeared in the latest frame.")
+            return False
+
+        if not send_click(
+            adb_path, device_serial, game_hwnd, use_adb, *icon_position
+        ):
+            return False
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            time.sleep(0.04)
+            map_frame = capture_screen(adb_path, device_serial, game_hwnd, use_adb)
+            if map_frame is None:
+                continue
+            state, icon_position = detect_game_ui(map_frame, templates)
+            if state in ("minimap", "disconnected"):
+                break
+
+    if state != "minimap":
+        print(f"[!] Minimap travel skipped: UI state is {state}.")
+        return False
+
+    alignment = align_minimap_to_reference(map_frame, reference)
+    if not alignment or not alignment.get("valid"):
+        details = alignment or {}
+        return fail_minimap_travel(
+            adb_path, device_serial, game_hwnd, use_adb, icon_position, templates,
+            "[!] Minimap alignment rejected "
+            f"(match {details.get('score', 0.0):.2f}, "
+            f"geometry {details.get('geometry', 0.0):.2f}, "
+            f"gap {details.get('gap', 0.0):.2f}); no movement tap sent."
+        )
+
+    player_screen = find_minimap_player(map_frame)
+    if player_screen is None:
+        return fail_minimap_travel(
+            adb_path, device_serial, game_hwnd, use_adb, icon_position, templates,
+            "[!] Minimap player marker was not found; no movement tap sent."
+        )
+
+    route_cache = getattr(travel_via_minimap, "route_cache", None)
+    if route_cache is None or route_cache[0] != id(reference):
+        safe_mask = build_minimap_safe_mask(reference)
+        waypoints = build_minimap_waypoints(safe_mask)
+        travel_via_minimap.route_cache = (id(reference), safe_mask, waypoints)
+    else:
+        _, safe_mask, waypoints = route_cache
+    destination = choose_minimap_destination(
+        map_frame, alignment, safe_mask, player_screen, waypoints
+    )
+    if destination is None:
+        return fail_minimap_travel(
+            adb_path, device_serial, game_hwnd, use_adb, icon_position, templates,
+            "[!] No safe visible minimap waypoint was found; no movement tap sent."
+        )
+
+    print(
+        f"[~] Minimap waypoint {destination} from player {player_screen} "
+        f"toward reference {getattr(choose_minimap_destination, 'last_route_target', '?')} "
+        f"(match {alignment['score']:.2f}, geometry {alignment['geometry']:.2f}, "
+        f"gap {alignment['gap']:.2f}, scale {alignment['scale']:.2f})."
+    )
+    sent = send_click(
+        adb_path, device_serial, game_hwnd, use_adb,
+        *destination, synchronous=True,
+    )
+    if sent:
+        time.sleep(0.07)
+    closed = tap_back_icon_and_confirm(
+        adb_path, device_serial, game_hwnd, use_adb,
+        icon_position, templates.get("backicon"),
+    )
+    return bool(sent and closed)
+
+def is_disconnected_screen(frame):
+    """Recognize the game's dark disconnect screen without changing templates."""
+    if frame is None:
+        return False
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    fh, fw = gray.shape
+    title = gray[int(fh * 0.18):int(fh * 0.32), int(fw * 0.32):int(fw * 0.68)]
+    reconnect = gray[int(fh * 0.58):int(fh * 0.74), int(fw * 0.14):int(fw * 0.49)]
+    return (
+        np.mean(gray < 24) > 0.82 and
+        np.count_nonzero(title > 175) > 250 and
+        np.count_nonzero(reconnect > 175) > 180
+    )
+
+def recover_unexpected_ui(frame, adb_path, device_serial, game_hwnd, use_adb, templates):
+    """Dismiss an unexpected panel or reconnect the game, keeping this process alive."""
+    if is_disconnected_screen(frame):
+        fh, fw = frame.shape[:2]
+        point = (int(fw * 0.3125), int(fh * 0.667))
+        send_click(adb_path, device_serial, game_hwnd, use_adb, *point)
+        print("[~] Disconnected screen detected; selected Reconnect and will resume automatically.")
+        return "reconnect"
+
+    back = find_back_icon(frame, templates)
+    if back is not None:
+        if tap_back_icon_and_confirm(
+            adb_path, device_serial, game_hwnd, use_adb,
+            back, templates.get("backicon"),
+        ):
+            print("[+] Back action closed the unexpected UI.")
+            return "back"
+        print("[!] Could not close the unexpected UI; recovery is backing off.")
+        return "failed"
+
+    press_ui_back(adb_path, device_serial, game_hwnd, use_adb)
+    time.sleep(0.35)
+    after = capture_screen(adb_path, device_serial, game_hwnd, use_adb)
+    if after is not None and detect_game_ui(after, templates)[0] == "combat":
+        print("[+] System Back closed the unexpected UI.")
+        return "back"
+    print("[!] System Back did not return to combat; recovery is backing off.")
+    return "failed"
+
+def press_ui_back(adb_path, device_serial, game_hwnd, use_adb):
+    """Dismiss an unexpected in-game panel without restarting the bot."""
+    if use_adb:
+        subprocess.Popen(
+            [adb_path, "-s", device_serial, "shell", "input", "keyevent", "4"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return
+
+    try:
+        import win32con
+        import win32gui
+        win32gui.PostMessage(game_hwnd, win32con.WM_KEYDOWN, win32con.VK_ESCAPE, 0)
+        win32gui.PostMessage(game_hwnd, win32con.WM_KEYUP, win32con.VK_ESCAPE, 0)
+    except Exception as e:
+        print(f"[!] Could not dismiss unexpected UI: {e}")
+
+def white_text_mask(image):
+    """Keep only near-white pixels used by the mob name template."""
+    channels = image.astype(np.int16)
+    return (
+        (channels.min(axis=2) >= WHITE_TEXT_MIN_CHANNEL) &
+        (channels.max(axis=2) - channels.min(axis=2) <= WHITE_TEXT_MAX_CHANNEL_SPREAD)
+    ).astype(np.uint8) * 255
+
+def purple_text_mask(image):
+    """Keep the saturated purple pixels used by the elite mob name template."""
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    return (
+        (hsv[:, :, 0] >= 138) & (hsv[:, :, 0] <= 154) &
+        (hsv[:, :, 1] >= 90) & (hsv[:, :, 2] >= 170)
+    ).astype(np.uint8) * 255
+
+def find_pickup_available(frame, templates):
+    """Locate the orange pickup button and reject its gray unavailable state."""
+    available = templates.get("pickup-available")
+    unavailable = templates.get("pickup-not-yet")
+    if frame is None or available is None or unavailable is None:
+        return None
+
+    fh, fw = frame.shape[:2]
+    left, right = int(fw * 0.82), fw
+    top, bottom = int(fh * 0.10), int(fh * 0.55)
+    region = frame[top:bottom, left:right]
+    best_available = (-1.0, None)
+    best_unavailable = -1.0
+
+    for scale in (0.75, 0.9, 1.0, 1.1, 1.25):
+        scaled_available = cv2.resize(available, None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
+        ah, aw = scaled_available.shape[:2]
+        if ah >= region.shape[0] or aw >= region.shape[1]:
+            continue
+        scores = cv2.matchTemplate(region, scaled_available, cv2.TM_CCOEFF_NORMED)
+        _, score, _, location = cv2.minMaxLoc(scores)
+        if score > best_available[0]:
+            best_available = (
+                score,
+                (left + location[0] + aw // 2, top + location[1] + ah // 2),
+            )
+
+        scaled_unavailable = cv2.resize(unavailable, (aw, ah), interpolation=cv2.INTER_NEAREST)
+        _, unavailable_score, _, _ = cv2.minMaxLoc(
+            cv2.matchTemplate(region, scaled_unavailable, cv2.TM_CCOEFF_NORMED)
+        )
+        best_unavailable = max(best_unavailable, unavailable_score)
+
+    score, position = best_available
+    if position is not None and score >= 0.86 and score >= best_unavailable + 0.08:
+        return position
+    return None
+
+def find_target_mobs(frame, template, center_x, center_y, threshold=MATCH_THRESHOLD, blacklist=None, curr_time=0.0, name_color="white", allow_scale_fallback=True, fallback_only=False):
     """
     Find mobs matching the template nametag.
     Uses fast two-tier matching (1.0x primary) to minimize CPU usage and prevent hardware heat.
     Returns list of targets sorted by distance (closest to center first).
     """
+    if isinstance(template, (list, tuple)):
+        matches = []
+        def collect(candidate_template, candidate_color, scale_fallback, fallback_pass=False):
+            found = find_target_mobs(
+                frame, candidate_template, center_x, center_y, threshold,
+                blacklist=blacklist, curr_time=curr_time, name_color=candidate_color,
+                allow_scale_fallback=scale_fallback, fallback_only=fallback_pass,
+            )
+            for candidate in found:
+                if any(
+                    abs(candidate["nx"] - existing["nx"]) < 30 and
+                    abs(candidate["ny"] - existing["ny"]) < 15
+                    for existing in matches
+                ):
+                    continue
+                matches.append(candidate)
+
+        for candidate_template, candidate_color in template:
+            collect(candidate_template, candidate_color, False)
+        if not matches:
+            for candidate_template, candidate_color in template:
+                collect(candidate_template, candidate_color, True, True)
+        matches.sort(key=lambda match: match["distance"])
+        return matches
+
     fh, fw = frame.shape[:2]
     top = int(fh * MARGIN_TOP)
     bot = int(fh * (1.0 - MARGIN_BOTTOM))
@@ -333,32 +1196,61 @@ def find_target_mobs(frame, template, center_x, center_y, threshold=MATCH_THRESH
     if playfield.size == 0:
         return []
 
-    gray_pf = cv2.cvtColor(playfield, cv2.COLOR_BGR2GRAY)
-    gray_tpl = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+    processing_scale = min(1.0, TARGET_SCAN_WIDTH / fw)
+    make_text_mask = purple_text_mask if name_color == "purple" else white_text_mask
+    if getattr(find_target_mobs, "_mask_frame", None) is not frame:
+        find_target_mobs._mask_frame = frame
+        find_target_mobs._text_masks = {}
+    text_pf = find_target_mobs._text_masks.get(name_color)
+    if text_pf is None:
+        if processing_scale < 1.0:
+            search_image = cv2.resize(
+                playfield, None, fx=processing_scale, fy=processing_scale,
+                interpolation=cv2.INTER_NEAREST,
+            )
+        else:
+            search_image = playfield
+        text_pf = make_text_mask(search_image)
+        find_target_mobs._text_masks[name_color] = text_pf
+    if cv2.countNonZero(text_pf) == 0:
+        return []
 
     matches = []
 
     def scan_scale(scale):
-        scaled = cv2.resize(gray_tpl, None, fx=scale, fy=scale) if scale != 1.0 else gray_tpl
+        combined_scale = scale * processing_scale
+        scaled_color = (
+            cv2.resize(template, None, fx=combined_scale, fy=combined_scale)
+            if combined_scale != 1.0 else template
+        )
+        scaled = make_text_mask(scaled_color)
         th, tw = scaled.shape[:2]
-        if th >= gray_pf.shape[0] or tw >= gray_pf.shape[1] or th < 3 or tw < 3:
+        if th >= text_pf.shape[0] or tw >= text_pf.shape[1] or th < 3 or tw < 3:
             return
 
-        res = cv2.matchTemplate(gray_pf, scaled, cv2.TM_CCOEFF_NORMED)
+        res = cv2.matchTemplate(text_pf, scaled, cv2.TM_CCOEFF_NORMED)
         loc = np.where(res >= threshold)
+        template_pixels = np.count_nonzero(scaled)
 
         for pt in zip(*loc[::-1]):
             px, py = pt
-            x = px + left
-            y = py + top
+            frame_patch = text_pf[py:py + th, px:px + tw]
+            shared_pixels = np.count_nonzero(cv2.bitwise_and(frame_patch, scaled))
+            if template_pixels == 0 or shared_pixels / template_pixels < 0.35:
+                continue
+
+            x = int(round(px / processing_scale)) + left
+            y = int(round(py / processing_scale)) + top
+            native_tw = max(1, int(round(template.shape[1] * scale)))
+            native_th = max(1, int(round(template.shape[0] * scale)))
 
             # Dedup close matches
             if any(abs(x - m["nx"]) < 30 and abs(y - m["ny"]) < 15 for m in matches):
                 continue
 
-            click_x = x + tw // 2
+            click_x = x + native_tw // 2
             # Lower the click further into the mob body/feet (hitbox)
-            click_y = y + th + int(MOB_BODY_Y_OFFSET * scale)
+            click_y = y + native_th + int(MOB_BODY_Y_OFFSET * scale)
 
             dist = ((click_x - center_x) ** 2 + (click_y - center_y) ** 2) ** 0.5
             if dist < PLAYER_DEADZONE_RADIUS:
@@ -372,17 +1264,18 @@ def find_target_mobs(frame, template, center_x, center_y, threshold=MATCH_THRESH
 
             if left <= click_x <= right and top <= click_y <= bot:
                 matches.append({
-                    "nx": x, "ny": y, "nw": tw, "nh": th,
+                    "nx": x, "ny": y, "nw": native_tw, "nh": native_th,
                     "click_x": click_x, "click_y": click_y,
                     "distance": dist, "score": float(res[py, px]),
                     "scale": scale
                 })
 
     # Tier 1: Check native 1.0x scale first (instant & covers ~99% of matches on ADB)
-    scan_scale(1.0)
+    if not fallback_only:
+        scan_scale(1.0)
 
     # Tier 2: Only test fallback scales if no mobs found at 1.0x (saves ~85% CPU power)
-    if not matches:
+    if allow_scale_fallback and not matches:
         for scale in [0.85, 1.15, 0.75, 1.25]:
             scan_scale(scale)
             if matches:
@@ -390,7 +1283,6 @@ def find_target_mobs(frame, template, center_x, center_y, threshold=MATCH_THRESH
 
     matches.sort(key=lambda m: m["distance"])
     return matches
-
 
 def get_marked_template():
     """Load templates/marked.png and extract the binary red border template."""
@@ -414,6 +1306,46 @@ def get_marked_template():
     get_marked_template._tpl = box
     return box
 
+def _match_marked_outline(mask, tpl, threshold=0.50):
+    """Return the matched marker center only when the red outline is present."""
+    th, tw = tpl.shape[:2]
+    if mask.shape[0] < th or mask.shape[1] < tw:
+        return None
+
+    result = cv2.matchTemplate(mask, tpl, cv2.TM_CCOEFF_NORMED)
+    _, match, _, location = cv2.minMaxLoc(result)
+    if match < threshold:
+        return None
+
+    x, y = location
+    visible = mask[y:y + th, x:x + tw] > 0
+    border = tpl > 0
+    border_pixels = max(1, int(np.count_nonzero(border)))
+    border_hit = np.count_nonzero(visible & border) / border_pixels
+
+    # A mob or nametag can hide two sides. Require a strong template alignment,
+    # enough total border pixels, and two substantial sides to reject red mobs.
+    thickness = max(3, min(10, int(round(min(th, tw) * 0.07))))
+    template_sides = (
+        border[:thickness, thickness:-thickness],
+        border[-thickness:, thickness:-thickness],
+        border[thickness:-thickness, :thickness],
+        border[thickness:-thickness, -thickness:],
+    )
+    visible_sides = (
+        visible[:thickness, thickness:-thickness],
+        visible[-thickness:, thickness:-thickness],
+        visible[thickness:-thickness, :thickness],
+        visible[thickness:-thickness, -thickness:],
+    )
+    side_hits = []
+    for side, visible_side in zip(template_sides, visible_sides):
+        side_pixels = max(1, int(np.count_nonzero(side)))
+        side_hits.append(np.count_nonzero(visible_side & side) / side_pixels)
+
+    if border_hit < 0.35 or sum(hit >= 0.22 for hit in side_hits) < 2:
+        return None
+    return x + tw // 2, y + th // 2
 
 def has_red_square(frame, tx=None, ty=None, radius=120):
     """
@@ -445,21 +1377,12 @@ def has_red_square(frame, tx=None, ty=None, radius=120):
         x2 = min(right, tx + radius)
         y1 = max(top, ty - radius)
         y2 = min(bot, ty + radius)
-        if x2 - x1 >= 72 and y2 - y1 >= 72:
+        th, tw = tpl.shape[:2]
+        if x2 - x1 >= tw and y2 - y1 >= th:
             crop_red = marker_red[y1:y2, x1:x2]
-            res = cv2.matchTemplate(crop_red, tpl, cv2.TM_CCOEFF_NORMED)
-            _, max_v, _, max_l = cv2.minMaxLoc(res)
-            if max_v >= 0.28:
-                cx = x1 + max_l[0] + 36
-                cy = y1 + max_l[1] + 36
-                return True, (cx, cy)
-
-            cnt = cv2.countNonZero(crop_red)
-            if cnt >= 35:
-                ys, xs = np.where(crop_red > 0)
-                cx = x1 + int(np.mean(xs))
-                cy = y1 + int(np.mean(ys))
-                return True, (cx, cy)
+            marker_center = _match_marked_outline(crop_red, tpl)
+            if marker_center is not None:
+                return True, (x1 + marker_center[0], y1 + marker_center[1])
         return False, None
 
     # 2. Global scan (current_target is None - checking if a mob is ALREADY locked on screen)
@@ -467,366 +1390,13 @@ def has_red_square(frame, tx=None, ty=None, radius=120):
     if cv2.countNonZero(pf_red) < 40:
         return False, None
 
-    res = cv2.matchTemplate(pf_red, tpl, cv2.TM_CCOEFF_NORMED)
-    min_v, max_v, min_l, max_l = cv2.minMaxLoc(res)
-    # Require strong correlation with templates/marked.png (rejects solid red mobs and noise)
-    if max_v >= 0.35:
-        cx = left + max_l[0] + 36
-        cy = top + max_l[1] + 36
+    marker_center = _match_marked_outline(pf_red, tpl)
+    if marker_center is not None:
+        cx = left + marker_center[0]
+        cy = top + marker_center[1]
         return True, (cx, cy)
 
     return False, None
-
-
-def auto_extract_template(frame):
-    """Extract a fresh nametag template from the current frame if needed."""
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (12, 3))
-    dilated = cv2.dilate(thresh, kernel, iterations=1)
-    cnts, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    fh, fw = frame.shape[:2]
-    candidates = []
-    for c in cnts:
-        x, y, w, h = cv2.boundingRect(c)
-        if w > h * 2 and 40 < w < 400 and 8 < h < 50 and y > fh * 0.10:
-            candidates.append((x, y, w, h))
-
-    if candidates:
-        candidates.sort(key=lambda c: c[2] * c[3], reverse=True)
-        x, y, w, h = candidates[0]
-        return frame[y:y+h, x:x+w]
-    return None
-
-
-def find_player_on_minimap(map_frame):
-    """
-    Detect player's position marker on the open minimap.
-    In Rucoy Online, the player pin is a bright cyan/blue marker
-    (~[252, 188, 60] BGR or HSV H:90..118, S:80..255, V:80..255).
-    Falls back to screen center (800, 450) if marker is obscured.
-    """
-    fh, fw = map_frame.shape[:2]
-    cx, cy = fw // 2, fh // 2
-
-    hsv = cv2.cvtColor(map_frame, cv2.COLOR_BGR2HSV)
-    mask = (hsv[:, :, 0] >= 90) & (hsv[:, :, 0] <= 118) & (hsv[:, :, 1] >= 80) & (hsv[:, :, 2] >= 80)
-
-    # Exclude UI headers/borders
-    top_ui = int(90 * (fh / 900.0))
-    bot_ui = int(810 * (fh / 900.0))
-    left_ui = int(120 * (fw / 1600.0))
-    right_ui = int(1480 * (fw / 1600.0))
-    mask[:top_ui, :] = False
-    mask[bot_ui:, :] = False
-    mask[:, :left_ui] = False
-    mask[:, right_ui:] = False
-
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask.astype(np.uint8))
-    best_dist = 999999
-    best_pt = (cx, cy)
-    found = False
-    for i in range(1, num_labels):
-        if stats[i, cv2.CC_STAT_AREA] >= 6:
-            c_x, c_y = centroids[i]
-            d = (c_x - cx) ** 2 + (c_y - cy) ** 2
-            if d < best_dist:
-                best_dist = d
-                best_pt = (int(round(c_x)), int(round(c_y)))
-                found = True
-    return best_pt, found
-
-
-def get_zombie_zone_walkable(map_frame, layout_img):
-    """
-    Align minimap-zombie-layout.png with open minimap frame.
-    The Rucoy minimap centers on the player, so the layout can appear at any
-    vertical/horizontal position depending on where the player is in the dungeon.
-    Uses multi-crop sliding window matching to handle all player positions.
-
-    Returns:
-      valid_mask: binary mask of walkable corridor pixels strictly inside the zombie farm
-      zone_info: dict with offset, scale, bbox, and match score
-    """
-    fh, fw = map_frame.shape[:2]
-    res_scale = fw / 1600.0
-    base_scale = 6.944444 * res_scale
-
-    # 1. Screen corridor mask (~[243, 243, 243])
-    diff = np.abs(map_frame.astype(np.int16) - np.array([243, 243, 243]))
-    fc = ((np.max(diff, axis=-1) <= 8) & (map_frame[:, :, 0] > 200)).astype(np.uint8) * 255
-    top_ui = int(90 * (fh / 900.0))
-    bot_ui = int(810 * (fh / 900.0))
-    left_ui = int(120 * res_scale)
-    right_ui = int(1480 * res_scale)
-    fc[:top_ui, :] = 0
-    fc[bot_ui:, :] = 0
-    fc[:, :left_ui] = 0
-    fc[:, right_ui:] = 0
-
-    if layout_img is None:
-        # Fallback if no layout template provided
-        return fc, {"offset": (0, 0), "scale": 1.0, "score": 0.0}
-
-    # 2. Layout corridors
-    diff_l = np.abs(layout_img.astype(np.int16) - np.array([243, 243, 243]))
-    lc = ((np.max(diff_l, axis=-1) <= 6) & (layout_img[:, :, 0] > 200)).astype(np.uint8)
-
-    # Safety clipping on layout edges:
-    # Only mask actual exit tunnels (south exit tunnel at rows 144..147, cols 60..80;
-    # and northeast connector at rows 0..8, cols 137+)
-    # Preserves the bottom main road (rows 140..143) and east road (cols 134..137) so the bot
-    # never gets trapped in corners or treats farm edges as out-of-bounds.
-    lc_safe = lc.copy()
-    if lc_safe.shape[0] >= 144:
-        lc_safe[144:, 60:80] = 0  # South exit tunnel leading out
-    if lc_safe.shape[1] >= 137:
-        lc_safe[:8, 137:] = 0    # Northeast connection leading out
-
-    best_score = 0
-    best_origin = (int(81 * res_scale), int(148 * (fh / 900.0)))  # fallback default
-    best_scale = base_scale
-
-    # 3. Multi-scale, multi-crop template matching
-    #    The minimap scrolls with the player, so the layout can be at any vertical
-    #    position on screen. We slide a matching window down the full scaled layout
-    #    to find the best alignment regardless of where the player is in the zone.
-    min_crop_h = int(300 * (fh / 900.0))   # minimum window height for reliable match
-    max_crop_h = int(650 * (fh / 900.0))   # max window height (fits within screen)
-    crop_step = int(80 * (fh / 900.0))     # step between vertical window positions
-
-    for s in [base_scale, base_scale * 0.99, base_scale * 1.01]:
-        sw = int(round(layout_img.shape[1] * s))
-        sh = int(round(layout_img.shape[0] * s))
-        if sw <= 0 or sh <= 0:
-            continue
-        scaled_lc = cv2.resize(lc_safe, (sw, sh), interpolation=cv2.INTER_NEAREST) * 255
-
-        # Slide vertical window across the full scaled layout
-        for crop_start in range(0, max(1, sh - min_crop_h + 1), crop_step):
-            crop_end = min(crop_start + max_crop_h, sh)
-            if crop_end - crop_start < min_crop_h:
-                continue
-
-            tpl = scaled_lc[crop_start:crop_end, :]
-            if tpl.shape[0] >= fc.shape[0] or tpl.shape[1] >= fc.shape[1]:
-                continue
-
-            res = cv2.matchTemplate(fc, tpl, cv2.TM_CCOEFF_NORMED)
-            _, max_v, _, max_l = cv2.minMaxLoc(res)
-
-            if max_v > best_score:
-                best_score = max_v
-                # max_l is screen position where crop_start row of layout appears
-                # Layout origin (0,0) is at: (max_l[0], max_l[1] - crop_start)
-                best_origin = (max_l[0], max_l[1] - crop_start)
-                best_scale = s
-
-    ox, oy = best_origin
-    sw = int(round(layout_img.shape[1] * best_scale))
-    sh = int(round(layout_img.shape[0] * best_scale))
-    scaled_safe = cv2.resize(lc_safe, (sw, sh), interpolation=cv2.INTER_NEAREST)
-
-    safe_mask = np.zeros((fh, fw), dtype=np.uint8)
-    # Handle negative offsets (layout extends beyond screen top/left when player is deep in zone)
-    src_x1, src_y1 = max(0, -ox), max(0, -oy)
-    dst_x1, dst_y1 = max(0, ox), max(0, oy)
-    src_x2 = min(sw, fw - ox)
-    src_y2 = min(sh, fh - oy)
-    dst_x2 = dst_x1 + (src_x2 - src_x1)
-    dst_y2 = dst_y1 + (src_y2 - src_y1)
-
-    if dst_x2 > dst_x1 and dst_y2 > dst_y1:
-        safe_mask[dst_y1:dst_y2, dst_x1:dst_x2] = scaled_safe[src_y1:src_y2, src_x1:src_x2]
-
-    # Intersection: pixels that are white in the game frame AND part of the zombie layout
-    valid_mask = ((fc > 0) & (safe_mask > 0)).astype(np.uint8)
-
-    zone_info = {
-        "offset": (ox, oy),
-        "size": (sw, sh),
-        "scale": best_scale,
-        "score": best_score,
-        "bbox": (dst_x1, dst_y1, dst_x2 - dst_x1, dst_y2 - dst_y1)
-    }
-    return valid_mask, zone_info
-
-
-def travel_via_minimap(adb_path, device_serial, game_hwnd=None, use_adb=True, templates=None):
-    """
-    Open minimap, recognize player location and zombie layout to prevent leaving the farm zone,
-    tap an optimal safe corridor destination, and close the minimap.
-    """
-    minimap_icon = templates.get("minimapicon") if templates else None
-    back_icon = templates.get("backicon") if templates else None
-    layout_img = templates.get("minimap-zombie-layout") if templates else None
-    if layout_img is None:
-        layout_path = os.path.join(TEMPLATE_DIR, "minimap-zombie-layout.png")
-        if os.path.exists(layout_path):
-            layout_img = cv2.imread(layout_path)
-
-    # Step 1: Click minimap button (default ~1150, 50 or dynamic template match)
-    open_x, open_y = 1150, 50
-    if use_adb:
-        adb_click(adb_path, device_serial, open_x, open_y)
-    else:
-        win32_click(game_hwnd, open_x, open_y)
-    time.sleep(0.55)
-
-    # Step 2: Capture open minimap frame
-    if use_adb:
-        map_frame = adb_capture(adb_path, device_serial)
-    else:
-        map_frame = win32_capture(game_hwnd)
-
-    if map_frame is None:
-        return False
-
-    fh, fw = map_frame.shape[:2]
-
-    # Dynamic back icon location (default ~1546, 44)
-    back_x, back_y = int(1546 * (fw / 1600.0)), int(44 * (fh / 900.0))
-    if back_icon is not None:
-        res_back = cv2.matchTemplate(map_frame, back_icon, cv2.TM_CCOEFF_NORMED)
-        _, bv, _, bl = cv2.minMaxLoc(res_back)
-        if bv > 0.65:
-            back_x = bl[0] + back_icon.shape[1] // 2
-            back_y = bl[1] + back_icon.shape[0] // 2
-
-    # Step 3: Recognize player position and zombie farm layout
-    (player_x, player_y), player_found = find_player_on_minimap(map_frame)
-    valid_mask, zone_info = get_zombie_zone_walkable(map_frame, layout_img)
-
-    # Detect if character is stuck at same minimap spot
-    hist = getattr(travel_via_minimap, '_history', {'last_pos': None, 'stuck_count': 0})
-    stuck_detected = False
-    if hist.get('last_pos') is not None and player_found:
-        dist_from_last = np.hypot(player_x - hist['last_pos'][0], player_y - hist['last_pos'][1])
-        if dist_from_last < 25:
-            hist['stuck_count'] = hist.get('stuck_count', 0) + 1
-            if hist['stuck_count'] >= 1:
-                stuck_detected = True
-        else:
-            hist['stuck_count'] = 0
-    hist['last_pos'] = (player_x, player_y)
-    travel_via_minimap._history = hist
-
-    # Screen corridor connectivity check (ensure candidate destinations are physically reachable)
-    diff = np.abs(map_frame.astype(np.int16) - np.array([243, 243, 243]))
-    fc = ((np.max(diff, axis=-1) <= 8) & (map_frame[:, :, 0] > 200)).astype(np.uint8) * 255
-    top_ui = int(90 * (fh / 900.0))
-    bot_ui = int(810 * (fh / 900.0))
-    left_ui = int(120 * (fw / 1600.0))
-    right_ui = int(1480 * (fw / 1600.0))
-    fc[:top_ui, :] = 0
-    fc[bot_ui:, :] = 0
-    fc[:, :left_ui] = 0
-    fc[:, right_ui:] = 0
-
-    kernel = np.ones((7, 7), np.uint8)
-    fc_connected = cv2.dilate(fc, kernel)
-    ys_fc, xs_fc = np.where(fc > 0)
-
-    reachable_mask = valid_mask.copy()
-    if len(xs_fc) > 0:
-        d_p = np.hypot(xs_fc - player_x, ys_fc - player_y)
-        near_idx = np.argmin(d_p)
-        _, labels = cv2.connectedComponents(fc_connected)
-        player_label = labels[ys_fc[near_idx], xs_fc[near_idx]]
-        connected_corridors = ((labels == player_label) & (valid_mask > 0)).astype(np.uint8)
-        if np.sum(connected_corridors > 0) >= 50:
-            reachable_mask = connected_corridors
-
-    ys, xs = np.where(reachable_mask > 0)
-    if len(xs) == 0:
-        ys, xs = np.where(valid_mask > 0)
-
-    if len(xs) > 0:
-        # Distance from player to all safe zombie corridor pixels
-        dists = np.sqrt((xs - player_x) ** 2 + (ys - player_y) ** 2)
-        min_dist_to_zone = np.min(dists)
-
-        # Center of zombie farm zone in screen coordinates
-        ox, oy = zone_info["offset"]
-        sw, sh = zone_info["size"]
-        zone_cx = ox + sw // 2
-        zone_cy = oy + sh // 2
-
-        # Outside threshold: ~80px away from any valid zombie farm corridor
-        outside_threshold = 80 * (fw / 1600.0)
-        is_outside = min_dist_to_zone > outside_threshold
-
-        if is_outside:
-            # Player wandered outside the zombie farm (e.g. skeleton area or exit)!
-            # Return immediately to the closest safe corridor in the zombie zone
-            print(f"[!] Minimap: Player is OUTSIDE Zombie Farm zone at ({player_x}, {player_y}) [dist: {min_dist_to_zone:.1f}px]!")
-            print(f"    -> Guiding character back to Zombie Farm safe corridor...")
-            candidates = np.where(dists <= min_dist_to_zone + 60 * (fw / 1600.0))[0]
-            chosen = random.choice(candidates)
-        elif stuck_detected:
-            # Player is stuck at a corner or obstacle! Pick a direct reachable step inward toward farm center
-            print(f"[!] Minimap: Stuck at corner ({player_x}, {player_y})! Forcing escape route toward farm center...")
-            min_walk = 120 * (fw / 1600.0)
-            max_walk = 250 * (fw / 1600.0)
-            in_range = np.where((dists >= min_walk) & (dists <= max_walk))[0]
-            if len(in_range) > 0:
-                dist_to_center = np.hypot(xs[in_range] - zone_cx, ys[in_range] - zone_cy)
-                chosen = in_range[np.argmin(dist_to_center)]
-            else:
-                chosen = np.argmin(dists)
-        else:
-            # Player is safely inside the zombie farm!
-            # Pick a destination 150px - 380px away to explore / patrol corridors
-            min_walk = 150 * (fw / 1600.0)
-            max_walk = 380 * (fw / 1600.0)
-            in_range = np.where((dists >= min_walk) & (dists <= max_walk))[0]
-            if len(in_range) > 0:
-                # If player is near the edge/corner (>300px from farm center), bias toward center
-                player_dist_to_center = np.hypot(player_x - zone_cx, player_y - zone_cy)
-                if player_dist_to_center > 280:
-                    cand_dists_to_center = np.hypot(xs[in_range] - zone_cx, ys[in_range] - zone_cy)
-                    # Pick from the top 30% of candidates that pull inward toward farm center
-                    sorted_indices = np.argsort(cand_dists_to_center)
-                    top_pool = sorted_indices[:max(1, len(sorted_indices) // 3)]
-                    chosen = in_range[random.choice(top_pool)]
-                else:
-                    chosen = random.choice(in_range)
-            else:
-                chosen = np.argmin(np.abs(dists - 240 * (fw / 1600.0)))
-
-        dest_x = int(xs[chosen])
-        dest_y = int(ys[chosen])
-        step_dist = int(np.hypot(dest_x - player_x, dest_y - player_y))
-        status_desc = "Returning to Farm" if is_outside else ("Escaping Corner" if stuck_detected else "Patrolling Farm")
-        p_tag = f"({player_x}, {player_y})" if player_found else f"({player_x}, {player_y}) [center fallback]"
-        print(f"[~] Minimap: {status_desc} -> Tapped ({dest_x}, {dest_y}) [player: {p_tag}, dist: {step_dist}px, zone: {zone_info['score']:.2f}, safe: {len(xs)}]...")
-
-        if use_adb:
-            adb_click(adb_path, device_serial, dest_x, dest_y)
-        else:
-            win32_click(game_hwnd, dest_x, dest_y)
-        time.sleep(0.25)
-    else:
-        # Fallback if no layout corridor detected: click safe area near screen center
-        rx = int(fw // 2 + random.randint(-120, 120))
-        ry = int(fh // 2 + random.randint(-80, 80))
-        print(f"[!] Minimap: No zombie corridors detected! Tapped fallback center ({rx}, {ry})...")
-        if use_adb:
-            adb_click(adb_path, device_serial, rx, ry)
-        else:
-            win32_click(game_hwnd, rx, ry)
-        time.sleep(0.25)
-
-    # Step 4: Close minimap via back icon
-    if use_adb:
-        adb_click(adb_path, device_serial, back_x, back_y)
-    else:
-        win32_click(game_hwnd, back_x, back_y)
-    time.sleep(0.4)
-    return True
-
-
 
 # ==============================================================================
 # MAIN ENGINE
@@ -842,32 +1412,21 @@ def main():
     template = templates.get("zombie_lv65")
     if template is None:
         template = templates.get("zombie")
-    if template is None and templates:
-        template = next(iter(templates.values()))
 
     if template is None:
         print(f"[-] No template found in {TEMPLATE_DIR}!")
         return
 
-    # Check Zombie Zone layout template for minimap travel
-    zombie_layout = templates.get("minimap-zombie-layout")
-    if zombie_layout is None:
-        layout_f = os.path.join(TEMPLATE_DIR, "minimap-zombie-layout.png")
-        if os.path.exists(layout_f):
-            zombie_layout = cv2.imread(layout_f)
-            templates["minimap-zombie-layout"] = zombie_layout
-
-    if zombie_layout is not None:
-        print(f"[+] Loaded Zombie Farm layout: templates/minimap-zombie-layout.png ({zombie_layout.shape[1]}x{zombie_layout.shape[0]})")
-    else:
-        print("[!] Warning: templates/minimap-zombie-layout.png not found! Minimap safety bounds disabled.")
+    target_templates = [(template, "white")]
+    purple_template = templates.get("purple_name_zombie_lv65")
+    if purple_template is not None:
+        target_templates.append((purple_template, "purple"))
 
     # 2. Determine mode (ADB vs Win32)
     use_adb = False
     adb_path = None
     device_serial = None
     game_hwnd = None
-    match_threshold = MATCH_THRESHOLD
 
     if PREFER_ADB:
         adb_path, device_serial = init_adb()
@@ -889,10 +1448,7 @@ def main():
 
     # 3. Capture test frame & calibrate template
     print("[+] Capturing initial frame...")
-    if use_adb:
-        test_frame = adb_capture(adb_path, device_serial)
-    else:
-        test_frame = win32_capture(game_hwnd)
+    test_frame = capture_screen(adb_path, device_serial, game_hwnd, use_adb)
 
     if test_frame is None:
         print("[-] Failed to capture initial frame! Check if emulator is running.")
@@ -910,16 +1466,8 @@ def main():
         if mx > best_score:
             best_score = mx
 
-    if best_score < match_threshold:
-        print(f"[!] Initial template score is {best_score:.2f}. Auto-extracting fresh template...")
-        fresh = auto_extract_template(test_frame)
-        if fresh is not None:
-            template = fresh
-            cv2.imwrite(os.path.join(TEMPLATE_DIR, "zombie_lv65.png"), fresh)
-            print(f"[+] Fresh template extracted and saved ({fresh.shape})")
-        else:
-            match_threshold = max(0.42, best_score - 0.05)
-            print(f"[+] Adjusted match threshold to {match_threshold:.2f}")
+    if best_score < MATCH_THRESHOLD:
+        print(f"[!] Level-specific template score is {best_score:.2f}; keeping the saved Zombie Lv.65 template.")
     else:
         print(f"[+] Template match verified (score: {best_score:.2f})")
 
@@ -929,19 +1477,24 @@ def main():
     confirmed_locked = False
     last_red_seen_time = 0.0
     last_log_time = 0.0
-    last_target_seen_time = time.time()
-    last_wander_time = 0.0
+    last_ui_back_time = 0.0
+    no_target_since = time.time()
     last_minimap_time = 0.0
-    patrol_heading = None       # Directional momentum (prevents back-and-forth ping pong)
-    patrol_step_count = 0
     frame_count = 0
     fail_counts = {}
     blacklist = {}
+    last_capture_warning = 0.0
+    pickup_pending = False
+    ui_recovery_interval = 1.5
+    failed_recovery_state = None
+    failed_recovery_count = 0
+    exhausted_caption_armed = True
+    exhausted_caption_clear_frames = 0
 
     print(f"\n[+] Target: '{TARGET_MOB_NAME}'")
     print(f"[+] Method: {'ADB Background Tap (Free Mouse)' if use_adb else 'Win32 Click'}")
     print(f"[+] Background: {'YES (Can stay behind other windows)' if use_adb else 'Window visible'}")
-    print(f"[+] Movement: {'Minimap Auto-Travel (Zombie Farm Boundary Locked)' if ENABLE_MINIMAP_WALK else 'Ground Patrol'}")
+    print(f"[+] Movement: Registered minimap waypoints ({'enabled' if ENABLE_MINIMAP_WALK else 'disabled'})")
     print(f"[+] Hitbox Offset: {MOB_BODY_Y_OFFSET}px below nametag (lowered for clean hits)")
     print(f"[+] Response Time: {TARGET_LOCK_TIMEOUT}s retry window (fast & responsive)")
     if SHOW_PREVIEW:
@@ -952,27 +1505,102 @@ def main():
 
     while True:
         # Capture frame
-        if use_adb:
-            frame = adb_capture(adb_path, device_serial)
-        else:
-            frame = win32_capture(game_hwnd)
+        frame = capture_screen(adb_path, device_serial, game_hwnd, use_adb)
 
         if frame is None:
+            if time.time() - last_capture_warning >= 5.0:
+                print("[!] Screen capture unavailable; retrying (ADB capture times out after 3s).")
+                last_capture_warning = time.time()
             time.sleep(0.3)
             continue
+        if last_capture_warning:
+            print("[+] Screen capture recovered.")
+            last_capture_warning = 0.0
 
         fh, fw = frame.shape[:2]
         cx, cy = fw // 2, fh // 2
         curr_time = time.time()
         frame_count += 1
 
+        ui_state, _ = detect_game_ui(frame, templates)
+        if ui_state == "combat":
+            failed_recovery_state = None
+            failed_recovery_count = 0
+        if ui_state != "combat":
+            if curr_time - last_ui_back_time >= (
+                4.0 if ui_state == "disconnected" else ui_recovery_interval
+            ):
+                print(f"[!] UI state is {ui_state}; recovering and resuming automatically...")
+                recovery = recover_unexpected_ui(
+                    frame, adb_path, device_serial, game_hwnd, use_adb, templates
+                )
+                ui_recovery_interval = 5.0 if recovery == "failed" else 1.5
+                if recovery == "failed":
+                    if failed_recovery_state == ui_state:
+                        failed_recovery_count += 1
+                    else:
+                        failed_recovery_state = ui_state
+                        failed_recovery_count = 1
+                    if failed_recovery_count >= REPEATED_OUTPUT_LIMIT:
+                        raise RepeatedOutputReset(
+                            f"UI recovery for '{ui_state}' failed "
+                            f"{failed_recovery_count} times"
+                        )
+                else:
+                    failed_recovery_state = None
+                    failed_recovery_count = 0
+                current_target = None
+                confirmed_locked = False
+                no_target_since = curr_time
+                last_ui_back_time = curr_time
+            time.sleep(0.08)
+            continue
+
         # Periodic cleanup of expired blacklist entries
         if blacklist and frame_count % 30 == 0:
             blacklist = {pos: exp for pos, exp in blacklist.items() if curr_time < exp}
 
+        if pickup_pending:
+            pickup_position = find_pickup_available(frame, templates)
+            if pickup_position is not None:
+                print(f"[+] Pickup available after kill; tapping ({pickup_position[0]}, {pickup_position[1]}).")
+                send_click(
+                    adb_path, device_serial, game_hwnd, use_adb, *pickup_position
+                )
+                pickup_pending = False
+
         # 1. If currently attacking a target, check for red square
+        caption_visible = False
+        if current_target is not None or not exhausted_caption_armed:
+            caption_visible = find_exhausted_caption(
+                frame, templates.get("exhausted-caption")
+            )
+            if caption_visible:
+                exhausted_caption_clear_frames = 0
+            else:
+                exhausted_caption_clear_frames += 1
+                if exhausted_caption_clear_frames >= 2:
+                    exhausted_caption_armed = True
+
+        if current_target is not None and exhausted_caption_armed and caption_visible:
+            tx, ty = current_target["click_x"], current_target["click_y"]
+            grid_pos = (int(tx // 40), int(ty // 40))
+            blacklist[grid_pos] = max(
+                blacklist.get(grid_pos, 0.0),
+                curr_time + EXHAUSTED_MOB_BLACKLIST_SECONDS,
+            )
+            fail_counts.pop(grid_pos, None)
+            print(
+                f"[~] Exhausted caption found; skipping mob at ({tx}, {ty}) "
+                f"for {EXHAUSTED_MOB_BLACKLIST_SECONDS:.0f}s. Looking for another."
+            )
+            current_target = None
+            confirmed_locked = False
+            no_target_since = curr_time
+            exhausted_caption_armed = False
+            exhausted_caption_clear_frames = 0
+
         if current_target is not None:
-            last_target_seen_time = curr_time
             tx, ty = current_target["click_x"], current_target["click_y"]
             has_red, updated_pos = has_red_square(frame, tx, ty)
 
@@ -995,25 +1623,33 @@ def main():
                         print(f"[+] Red square gone for {curr_time - last_red_seen_time:.1f}s! Mob defeated. Searching next...")
                         current_target = None
                         confirmed_locked = False
-                        last_target_seen_time = curr_time
+                        no_target_since = curr_time
+                        pickup_pending = True
                 elif curr_time - target_click_time > TARGET_LOCK_TIMEOUT:
-                    print(f"[-] No target lock after {TARGET_LOCK_TIMEOUT}s. Retrying...")
+                    print(
+                        f"[-] No target lock after {TARGET_LOCK_TIMEOUT}s. "
+                        "Skipping this click location for 30.0s to avoid toggling its mark..."
+                    )
                     grid_pos = (int(tx // 40), int(ty // 40))
-                    fail_counts[grid_pos] = fail_counts.get(grid_pos, 0) + 1
-                    if fail_counts[grid_pos] >= 2:
-                        print(f"[!] Target at ({tx}, {ty}) unreachable or missed twice. Skipping for 4.0s...")
-                        blacklist[grid_pos] = curr_time + 4.0
-                        fail_counts[grid_pos] = 0
+                    blacklist[grid_pos] = curr_time + 30.0
+                    fail_counts.pop(grid_pos, None)
                     current_target = None
                     confirmed_locked = False
-                    last_target_seen_time = curr_time
+                    no_target_since = curr_time
 
         # 2. If idle, search for new mob
         if current_target is None:
             # First check if a mob is ALREADY targeted/marked in the playfield!
             # In Rucoy, tapping an already-targeted mob CANCELS the attack, so never re-click it.
             has_red, active_pos = has_red_square(frame)
-            if has_red and active_pos is not None:
+            active_grid = (
+                (int(active_pos[0] // 40), int(active_pos[1] // 40))
+                if active_pos is not None else None
+            )
+            if (
+                has_red and active_pos is not None and
+                curr_time >= blacklist.get(active_grid, 0.0)
+            ):
                 ax, ay = active_pos
                 print(f"[*] Detected active target lock at ({ax}, {ay})! Adopting target...")
                 current_target = {
@@ -1028,97 +1664,54 @@ def main():
                 confirmed_locked = True
                 continue
 
-            mobs = find_target_mobs(frame, template, cx, cy, match_threshold, blacklist=blacklist, curr_time=curr_time)
+            mobs = find_target_mobs(
+                frame, target_templates, cx, cy, MATCH_THRESHOLD,
+                blacklist=blacklist, curr_time=curr_time,
+            )
 
             if mobs:
-                last_target_seen_time = curr_time
-                patrol_heading = None
-                patrol_step_count = 0
                 best = mobs[0]
                 bx, by = best["click_x"], best["click_y"]
                 dist = int(best["distance"])
                 score = best["score"]
                 scale = best["scale"]
 
+                send_click(adb_path, device_serial, game_hwnd, use_adb, bx, by)
                 print(f"[+] Found {len(mobs)} '{TARGET_MOB_NAME}' (score:{score:.2f} scale:{scale:.1f}x)")
                 print(f"    -> Clicking mob at ({bx}, {by}) [dist:{dist}px]")
-
-                if use_adb:
-                    adb_click(adb_path, device_serial, bx, by)
-                else:
-                    win32_click(game_hwnd, bx, by)
 
                 current_target = best
                 target_click_time = curr_time
                 last_red_seen_time = curr_time
                 confirmed_locked = False
-                time.sleep(0.12)
+                no_target_since = curr_time
+                time.sleep(0.04)
             else:
                 if curr_time - last_log_time > 5.0:
                     print(f"[...] Scanning for '{TARGET_MOB_NAME}'... (frame #{frame_count}, res {fw}x{fh})")
                     last_log_time = curr_time
 
-                # Movement when no targets in vision:
-                idle_duration = curr_time - last_target_seen_time
-
-                # 1. Primary: Minimap Auto-Travel (Open minimap, tap corridor destination, close)
-                if ENABLE_MINIMAP_WALK and (idle_duration >= MINIMAP_IDLE_DELAY) and (curr_time - last_minimap_time >= MINIMAP_COOLDOWN):
-                    print(f"[~] No zombies in vision for {idle_duration:.1f}s -> Opening minimap to travel...")
-                    travel_via_minimap(adb_path, device_serial, game_hwnd=game_hwnd, use_adb=use_adb, templates=templates)
-                    curr_time = time.time()
-                    last_minimap_time = curr_time
-                    last_target_seen_time = curr_time
-
-                # 2. Fallback: Periodic ground walking / patrol
-                elif ENABLE_WANDER and (idle_duration >= WANDER_IDLE_DELAY) and (curr_time - last_wander_time >= WANDER_COOLDOWN):
-                    # Pick an initial heading on first wander step, or maintain general direction
-                    if patrol_heading is None:
-                        patrol_heading = random.uniform(0, 2 * math.pi)
-                        patrol_step_count = 0
-
-                    # Keep general heading with slight natural variation (+/- 20 degrees)
-                    angle = patrol_heading + random.uniform(-0.35, 0.35)
-                    r = random.randint(WANDER_RADIUS_MIN, WANDER_RADIUS_MAX)
-
-                    # 16:9 vertical scale: 0.65 keeps vertical steps proportional and far from top/bottom UI
-                    wx = int(cx + r * math.cos(angle))
-                    wy = int(cy + (r * 0.65) * math.sin(angle))
-
-                    # Strict inner playfield bounds (keeps at least 380px from left/right and 180px from top/bottom)
-                    max_x_offset = min(WANDER_RADIUS_MAX, 400)
-                    max_y_offset = int(max_x_offset * 0.65)
-                    clamped_x = max(cx - max_x_offset, min(cx + max_x_offset, wx))
-                    clamped_y = max(cy - max_y_offset, min(cy + max_y_offset, wy))
-
-                    # If we reached the boundary of the safe zone, rotate heading smoothly away
-                    if clamped_x != wx or clamped_y != wy:
-                        patrol_heading = (patrol_heading + random.choice([1.2, -1.2])) % (2 * math.pi)
-                        wx, wy = clamped_x, clamped_y
-                    else:
-                        wx, wy = clamped_x, clamped_y
-
-                    patrol_step_count += 1
-                    # After 3-4 consecutive steps forward in this direction, curve towards a new area
-                    if patrol_step_count >= 3:
-                        patrol_heading = (patrol_heading + random.uniform(0.8, 1.4)) % (2 * math.pi)
-                        patrol_step_count = 0
-
-                    heading_deg = int(math.degrees(patrol_heading))
-                    print(f"[~] No target in vision for {idle_duration:.1f}s -> Patrolling to ({wx}, {wy}) [heading: {heading_deg}°]...")
-                    if use_adb:
-                        adb_click(adb_path, device_serial, wx, wy)
-                    else:
-                        win32_click(game_hwnd, wx, wy)
-
-                    last_wander_time = curr_time
-                    time.sleep(0.2)
+                idle_duration = curr_time - no_target_since
+                if (
+                    ENABLE_MINIMAP_WALK and
+                    idle_duration >= MINIMAP_IDLE_DELAY and
+                    curr_time - last_minimap_time >= MINIMAP_COOLDOWN
+                ):
+                    print(
+                        f"[~] No '{TARGET_MOB_NAME}' in vision for "
+                        f"{idle_duration:.1f}s -> registering minimap waypoint..."
+                    )
+                    travel_via_minimap(
+                        adb_path, device_serial, game_hwnd, use_adb, templates
+                    )
+                    now = time.time()
+                    last_minimap_time = now
+                    no_target_since = now
 
         # 3. Preview window
         if SHOW_PREVIEW:
             disp = frame.copy()
             cv2.circle(disp, (cx, cy), PLAYER_DEADZONE_RADIUS, (255, 255, 0), 1)
-            if ENABLE_WANDER:
-                cv2.ellipse(disp, (cx, cy), (WANDER_RADIUS_MAX, int(WANDER_RADIUS_MAX * 0.65)), 0, 0, 360, (60, 60, 60), 1)
             if current_target:
                 tx, ty = current_target["click_x"], current_target["click_y"]
                 color = (0, 0, 255) if confirmed_locked else (0, 255, 0)
@@ -1138,6 +1731,56 @@ def main():
         cv2.destroyAllWindows()
     print("[+] Bot stopped.")
 
+def run_bot():
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    repeat_guard = RepeatedOutputGuard()
+    if isinstance(original_stdout, TimestampedOutputStream):
+        output_stream = original_stdout
+        output_stream.guard = repeat_guard
+    else:
+        output_stream = TimestampedOutputStream(original_stdout, repeat_guard)
+    error_stream = (
+        original_stderr
+        if isinstance(original_stderr, TimestampedOutputStream)
+        else TimestampedOutputStream(original_stderr)
+    )
+    sys.stdout = output_stream
+    sys.stderr = error_stream
+    print(f"[+] Repeated warning/status watchdog armed at {REPEATED_OUTPUT_LIMIT} matches.")
+    auto_resets = 0
+    try:
+        while True:
+            try:
+                main()
+                break
+            except RepeatedOutputReset as error:
+                auto_resets += 1
+                if auto_resets > 1:
+                    sys.stdout.write(
+                        "[!] The same output loop returned after an automatic reset; "
+                        "stopping to prevent repeated restarts.\n"
+                    )
+                    sys.stdout.flush()
+                    break
+                sys.stdout.write(
+                    f"\n[!] Output pattern repeated {REPEATED_OUTPUT_LIMIT} times; "
+                    f"resetting the bot engine: {error.pattern}\n"
+                )
+                sys.stdout.flush()
+                repeat_guard.counts.clear()
+            except KeyboardInterrupt:
+                sys.stdout.write("\n[+] Interrupt received; bot stopped cleanly.\n")
+                sys.stdout.flush()
+                break
+    finally:
+        output_stream.guard = None
+        output_stream.flush()
+        error_stream.flush()
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        if SHOW_PREVIEW:
+            cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    main()
+    run_bot()
