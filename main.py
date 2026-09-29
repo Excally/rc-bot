@@ -57,17 +57,23 @@ PLAYER_DEADZONE_RADIUS = 60
 # Template matching minimum score
 MATCH_THRESHOLD = 0.55
 TARGET_SCAN_WIDTH = 1100
-UI_MATCH_THRESHOLD = 0.68
+UI_MATCH_THRESHOLD = 0.80
+BACK_ICON_MATCH_THRESHOLD = 0.86
 BACK_ICON_CENTER = (1546, 44)
-BACK_ICON_SCALES = (0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 1.0)
+BACK_ICON_SCALES = (1.0, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6)
 WHITE_TEXT_MIN_CHANNEL = 190
 WHITE_TEXT_MAX_CHANNEL_SPREAD = 50
 
 # How long (seconds) to wait for red target square after clicking mob (gives time to walk/lock)
-TARGET_LOCK_TIMEOUT = 2.5
+TARGET_LOCK_TIMEOUT = 1.5
+TARGET_RETRY_LIMIT = 2
+TARGET_RETRY_BLACKLIST_SECONDS = 4.0
+IDLE_MARK_CHECK_INTERVAL = 1.0
 
 # Grace period (seconds) before confirming mob is defeated when red square drops (prevents flicker drops)
 TARGET_DEFEATED_GRACE_TIME = 0.70
+EXHAUSTED_CAPTION_CONFIRM_SECONDS = 10.0
+EXHAUSTED_CAPTION_POLL_SECONDS = 0.25
 EXHAUSTED_MOB_BLACKLIST_SECONDS = 600.0
 REPEATED_OUTPUT_LIMIT = 20
 # ==============================================================================
@@ -402,18 +408,22 @@ def load_templates():
                 name = os.path.splitext(f)[0]
                 if name not in required:
                     continue
-                img = cv2.imread(os.path.join(TEMPLATE_DIR, f))
+                read_mode = (
+                    cv2.IMREAD_UNCHANGED
+                    if name in {"backicon", "minimapicon"}
+                    else cv2.IMREAD_COLOR
+                )
+                img = cv2.imread(os.path.join(TEMPLATE_DIR, f), read_mode)
                 if img is not None:
                     templates[name] = img
     return templates
 
 def find_exhausted_caption(frame, template):
-    """Detect the template's red banner using its color, aspect, and density."""
+    """Detect the long red exhausted caption in its lower playfield band."""
     if frame is None or template is None:
         return False
 
     fh, fw = frame.shape[:2]
-    screen_scale = fw / 1600.0
     cached = getattr(find_exhausted_caption, "_template_cache", None)
     if cached is None or cached[0] is not template:
         template_hsv = cv2.cvtColor(template, cv2.COLOR_BGR2HSV)
@@ -426,16 +436,16 @@ def find_exhausted_caption(frame, template):
         points = cv2.findNonZero(template_mask)
         if points is None:
             return False
-        _, _, template_w, template_h = cv2.boundingRect(points)
-        density = cv2.countNonZero(template_mask) / (template_w * template_h)
-        cached = (template, template_w, template_h, density)
+        x, y, width, height = cv2.boundingRect(points)
+        template_mask = template_mask[y:y + height, x:x + width]
+        density = cv2.countNonZero(template_mask) / (width * height)
+        cached = (template, width, height, density)
         find_exhausted_caption._template_cache = cached
 
-    template_w, template_h, density = cached[1:]
-    x0, x1 = int(fw * 0.12), int(fw * 0.88)
-    y1 = int(fh * 0.50)
-    region = frame[:y1, x0:x1]
-    processing_scale = min(0.5, 800.0 / max(1, region.shape[1]))
+    _, template_w, template_h, density = cached
+    x0, x1 = int(fw * 0.05), int(fw * 0.95)
+    y0, y1 = int(fh * 0.50), int(fh * 0.85)
+    region = frame[y0:y1, x0:x1]
     frame_hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
     hue = frame_hsv[:, :, 0]
     red_mask = (
@@ -443,6 +453,9 @@ def find_exhausted_caption(frame, template):
         (frame_hsv[:, :, 1] >= 110) &
         (frame_hsv[:, :, 2] >= 90)
     ).astype(np.uint8) * 255
+
+    screen_scale = fw / 1600.0
+    processing_scale = min(0.5, 800.0 / max(1, region.shape[1]))
     if processing_scale < 1.0:
         red_mask = cv2.resize(
             red_mask, None, fx=processing_scale, fy=processing_scale,
@@ -450,14 +463,16 @@ def find_exhausted_caption(frame, template):
         )
     close_width = max(5, int(round(15 * screen_scale * processing_scale)))
     joined = cv2.morphologyEx(
-        red_mask, cv2.MORPH_CLOSE, np.ones((3, close_width), dtype=np.uint8)
+        red_mask, cv2.MORPH_CLOSE,
+        np.ones((3, close_width), dtype=np.uint8),
     )
     count, _, stats, _ = cv2.connectedComponentsWithStats(joined, 8)
     expected_w = template_w * screen_scale * processing_scale
     expected_h = template_h * screen_scale * processing_scale
     min_w, max_w = expected_w * 0.50, expected_w * 1.20
     min_h, max_h = expected_h * 0.45, expected_h * 1.50
-    min_aspect, max_aspect = (template_w / template_h) * 0.55, (template_w / template_h) * 1.70
+    min_aspect = (template_w / template_h) * 0.55
+    max_aspect = (template_w / template_h) * 1.70
     min_density, max_density = density * 0.45, min(0.78, density * 1.80)
 
     for x, y, width, height, _ in stats[1:count]:
@@ -466,28 +481,34 @@ def find_exhausted_caption(frame, template):
         aspect = width / max(1, height)
         if not (min_aspect <= aspect <= max_aspect):
             continue
-        red_pixels = cv2.countNonZero(red_mask[y:y + height, x:x + width])
-        region_density = red_pixels / (width * height)
+        region_density = cv2.countNonZero(red_mask[y:y + height, x:x + width]) / (width * height)
         if min_density <= region_density <= max_density:
             return True
     return False
 
-def find_fixed_ui_icon(frame, icon, expected_center, threshold=UI_MATCH_THRESHOLD, search_radius=(90, 70), scale_adjustments=(0.75, 0.8, 0.85, 0.9, 1.0, 1.1)):
+def find_fixed_ui_icon(frame, icon, expected_center, threshold=UI_MATCH_THRESHOLD, search_radius=(90, 70), scale_adjustments=(1.0, 0.9, 0.85, 0.8, 0.75, 1.1)):
     """Match a fixed UI icon near its known screen position."""
     if frame is None or icon is None:
         return None
+
+    alpha = icon[:, :, 3] if icon.ndim == 3 and icon.shape[2] == 4 else None
+    if alpha is not None:
+        icon = icon[:, :, :3]
 
     fh, fw = frame.shape[:2]
     sx, sy = fw / 1600.0, fh / 900.0
     center_x, center_y = int(expected_center[0] * sx), int(expected_center[1] * sy)
     radius_x, radius_y = int(search_radius[0] * sx), int(search_radius[1] * sy)
     best_score, best_center = -1.0, None
+    match_threshold = max(threshold, UI_MATCH_THRESHOLD) if alpha is not None else threshold
 
     # Game UI icons can be rendered smaller than their saved templates at
     # different emulator UI scales, even when their screen position is fixed.
     for scale_adjustment in scale_adjustments:
         scale = sx * scale_adjustment
-        scaled = cv2.resize(icon, None, fx=scale, fy=scale)
+        scaled = cv2.resize(
+            icon, None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST
+        )
         ih, iw = scaled.shape[:2]
         if ih >= fh or iw >= fw:
             continue
@@ -500,18 +521,31 @@ def find_fixed_ui_icon(frame, icon, expected_center, threshold=UI_MATCH_THRESHOL
         if region.shape[0] < ih or region.shape[1] < iw:
             continue
 
-        result = cv2.matchTemplate(region, scaled, cv2.TM_CCOEFF_NORMED)
-        _, score, _, location = cv2.minMaxLoc(result)
+        if alpha is not None:
+            scaled_alpha = cv2.resize(
+                alpha, (iw, ih), interpolation=cv2.INTER_NEAREST
+            )
+            mask = np.where(scaled_alpha > 0, 255, 0).astype(np.uint8)
+            result = cv2.matchTemplate(
+                region, scaled, cv2.TM_SQDIFF_NORMED, mask=mask
+            )
+            minimum, _, location, _ = cv2.minMaxLoc(result)
+            score = 1.0 - minimum
+        else:
+            result = cv2.matchTemplate(region, scaled, cv2.TM_CCOEFF_NORMED)
+            _, score, _, location = cv2.minMaxLoc(result)
         if score > best_score:
             best_score = score
             best_center = (left + location[0] + iw // 2, top + location[1] + ih // 2)
+        if score >= match_threshold + 0.02:
+            return best_center
 
-    return best_center if best_score >= threshold else None
+    return best_center if best_score >= match_threshold else None
 
 def find_back_icon(frame, templates):
     return find_fixed_ui_icon(
         frame, templates.get("backicon"), BACK_ICON_CENTER,
-        threshold=0.40, search_radius=(35, 30),
+        threshold=BACK_ICON_MATCH_THRESHOLD, search_radius=(35, 30),
         scale_adjustments=BACK_ICON_SCALES,
     )
 
@@ -528,33 +562,42 @@ def detect_game_ui(frame, templates):
     return "other", None
 
 def tap_back_icon_and_confirm(adb_path, device_serial, game_hwnd, use_adb, back, back_icon):
-    """Tap Back once, allow the UI to react, then use system Back if needed."""
-    tapped = send_click(
-        adb_path, device_serial, game_hwnd, use_adb, *back, synchronous=True
-    )
-    if not tapped:
-        print("[!] Back-icon tap failed; trying the system Back action.")
-    else:
-        time.sleep(0.35)
+    """Tap the matched Back icon, refresh its position once, then use system Back."""
+    for attempt in range(2):
+        tapped = send_click(
+            adb_path, device_serial, game_hwnd, use_adb, *back, synchronous=True
+        )
+        if not tapped:
+            print(f"[!] Back-icon tap {attempt + 1} failed.")
+
+        time.sleep(0.45)
         frame = capture_screen(adb_path, device_serial, game_hwnd, use_adb)
         if frame is None:
             print("[!] Could not verify the panel closed after tapping Back.")
-            return False
+            break
         if back_icon is None:
-            print("[!] Back icon template is unavailable; panel closure could not be verified.")
-            return False
-        if find_fixed_ui_icon(
-            frame, back_icon, BACK_ICON_CENTER, threshold=0.40,
+            print("[!] Back icon template is unavailable; trying the system Back action.")
+            break
+
+        refreshed_back = find_fixed_ui_icon(
+            frame, back_icon, BACK_ICON_CENTER, threshold=BACK_ICON_MATCH_THRESHOLD,
             search_radius=(35, 30), scale_adjustments=BACK_ICON_SCALES,
-        ) is None:
+        )
+        if refreshed_back is None:
             return True
-        print("[!] Back icon remains visible; trying the system Back action.")
+        if attempt == 0:
+            back = refreshed_back
+            print(
+                f"[!] Back icon remains visible at {back}; retrying its fresh match."
+            )
+        else:
+            print("[!] Back icon remains visible after retry; trying the system Back action.")
 
     press_ui_back(adb_path, device_serial, game_hwnd, use_adb)
-    time.sleep(0.35)
+    time.sleep(0.45)
     frame = capture_screen(adb_path, device_serial, game_hwnd, use_adb)
     if frame is not None and back_icon is not None and find_fixed_ui_icon(
-        frame, back_icon, BACK_ICON_CENTER, threshold=0.40,
+        frame, back_icon, BACK_ICON_CENTER, threshold=BACK_ICON_MATCH_THRESHOLD,
         search_radius=(35, 30), scale_adjustments=BACK_ICON_SCALES,
     ) is None:
         return True
@@ -1103,11 +1146,25 @@ def press_ui_back(adb_path, device_serial, game_hwnd, use_adb):
 
 def white_text_mask(image):
     """Keep only near-white pixels used by the mob name template."""
-    channels = image.astype(np.int16)
-    return (
-        (channels.min(axis=2) >= WHITE_TEXT_MIN_CHANNEL) &
-        (channels.max(axis=2) - channels.min(axis=2) <= WHITE_TEXT_MAX_CHANNEL_SPREAD)
-    ).astype(np.uint8) * 255
+    blue, green, red = cv2.split(image)
+    bright = cv2.inRange(
+        image,
+        (WHITE_TEXT_MIN_CHANNEL,) * 3,
+        (255, 255, 255),
+    )
+    spread_bg = cv2.inRange(
+        cv2.absdiff(blue, green), 0, WHITE_TEXT_MAX_CHANNEL_SPREAD
+    )
+    spread_gr = cv2.inRange(
+        cv2.absdiff(green, red), 0, WHITE_TEXT_MAX_CHANNEL_SPREAD
+    )
+    spread_br = cv2.inRange(
+        cv2.absdiff(blue, red), 0, WHITE_TEXT_MAX_CHANNEL_SPREAD
+    )
+    cv2.bitwise_and(bright, spread_bg, dst=bright)
+    cv2.bitwise_and(bright, spread_gr, dst=bright)
+    cv2.bitwise_and(bright, spread_br, dst=bright)
+    return bright
 
 def purple_text_mask(image):
     """Keep the saturated purple pixels used by the elite mob name template."""
@@ -1306,6 +1363,19 @@ def get_marked_template():
     get_marked_template._tpl = box
     return box
 
+def _get_marker_red_mask(frame):
+    """Build the marker-color mask once per captured frame."""
+    if getattr(_get_marker_red_mask, "_frame", None) is frame:
+        return _get_marker_red_mask._mask
+
+    mask = cv2.inRange(frame, (28, 28, 185), (72, 72, 229))
+    fh, fw = frame.shape[:2]
+    mask[int(fh * 0.75):, :int(fw * 0.18)] = 0
+    mask[int(fh * 0.45):int(fh * 0.75), int(fw * 0.90):] = 0
+    _get_marker_red_mask._frame = frame
+    _get_marker_red_mask._mask = mask
+    return mask
+
 def _match_marked_outline(mask, tpl, threshold=0.50):
     """Return the matched marker center only when the red outline is present."""
     th, tw = tpl.shape[:2]
@@ -1363,13 +1433,7 @@ def has_red_square(frame, tx=None, ty=None, radius=120):
 
     tpl = get_marked_template()
 
-    # Exact Rucoy marker color: BGR [50, 50, 207] (strict tolerance to reject red mobs / orange tones)
-    diff = np.abs(frame.astype(np.int32) - np.array([50, 50, 207], dtype=np.int32))
-    marker_red = (np.all(diff <= 22, axis=2)).astype(np.uint8) * 255
-
-    # Exclude UI areas (potions/spells bottom-left, action buttons right edge)
-    marker_red[int(fh * 0.75):, :int(fw * 0.18)] = 0
-    marker_red[int(fh * 0.45):int(fh * 0.75), int(fw * 0.90):] = 0
+    marker_red = _get_marker_red_mask(frame)
 
     # 1. Local check around actively targeted mob (tx, ty)
     if tx is not None and ty is not None:
@@ -1483,20 +1547,29 @@ def main():
     frame_count = 0
     fail_counts = {}
     blacklist = {}
+    retry_context = None
+    idle_mark_check_needed = True
+    next_idle_mark_check_at = 0.0
+    ignored_exhausted_marker = None
     last_capture_warning = 0.0
     pickup_pending = False
     ui_recovery_interval = 1.5
     failed_recovery_state = None
     failed_recovery_count = 0
-    exhausted_caption_armed = True
-    exhausted_caption_clear_frames = 0
+    exhausted_caption_check_at = None
+    exhausted_caption_next_poll = 0.0
+    exhausted_caption_target = None
 
     print(f"\n[+] Target: '{TARGET_MOB_NAME}'")
     print(f"[+] Method: {'ADB Background Tap (Free Mouse)' if use_adb else 'Win32 Click'}")
     print(f"[+] Background: {'YES (Can stay behind other windows)' if use_adb else 'Window visible'}")
     print(f"[+] Movement: Registered minimap waypoints ({'enabled' if ENABLE_MINIMAP_WALK else 'disabled'})")
     print(f"[+] Hitbox Offset: {MOB_BODY_Y_OFFSET}px below nametag (lowered for clean hits)")
-    print(f"[+] Response Time: {TARGET_LOCK_TIMEOUT}s retry window (fast & responsive)")
+    print(
+        f"[+] Target lock check: {TARGET_LOCK_TIMEOUT:.1f}s; "
+        f"retry blacklist after {TARGET_RETRY_LIMIT} misses "
+        f"({TARGET_RETRY_BLACKLIST_SECONDS:.0f}s)"
+    )
     if SHOW_PREVIEW:
         print("[+] Preview: ON (Press 'q' in preview window to exit)")
     else:
@@ -1551,6 +1624,7 @@ def main():
                     failed_recovery_count = 0
                 current_target = None
                 confirmed_locked = False
+                idle_mark_check_needed = True
                 no_target_since = curr_time
                 last_ui_back_time = curr_time
             time.sleep(0.08)
@@ -1570,42 +1644,104 @@ def main():
                 pickup_pending = False
 
         # 1. If currently attacking a target, check for red square
+        if current_target is not exhausted_caption_target:
+            exhausted_caption_target = current_target
+            exhausted_caption_check_at = None
+            exhausted_caption_next_poll = 0.0
+
         caption_visible = False
-        if current_target is not None or not exhausted_caption_armed:
+        caption_check_due = (
+            current_target is not None and
+            (
+                curr_time >= exhausted_caption_next_poll or
+                (
+                    exhausted_caption_check_at is not None and
+                    curr_time >= exhausted_caption_check_at
+                )
+            )
+        )
+        if caption_check_due:
             caption_visible = find_exhausted_caption(
                 frame, templates.get("exhausted-caption")
             )
+            exhausted_caption_next_poll = curr_time + EXHAUSTED_CAPTION_POLL_SECONDS
+        if current_target is None:
+            exhausted_caption_check_at = None
+        elif exhausted_caption_check_at is None:
+            if caption_check_due and caption_visible:
+                exhausted_caption_check_at = curr_time + EXHAUSTED_CAPTION_CONFIRM_SECONDS
+                print(
+                    f"[~] Exhausted caption detected; checking again in "
+                    f"{EXHAUSTED_CAPTION_CONFIRM_SECONDS:.0f}s."
+                )
+        elif curr_time >= exhausted_caption_check_at and caption_check_due:
+            exhausted_caption_check_at = None
             if caption_visible:
-                exhausted_caption_clear_frames = 0
+                tx, ty = current_target["click_x"], current_target["click_y"]
+                grid_pos = (int(tx // 40), int(ty // 40))
+                blacklist[grid_pos] = max(
+                    blacklist.get(grid_pos, 0.0),
+                    curr_time + EXHAUSTED_MOB_BLACKLIST_SECONDS,
+                )
+                retry_grid = current_target.get("retry_grid")
+                if retry_grid is not None:
+                    fail_counts.pop(retry_grid, None)
+                    blacklist[retry_grid] = max(
+                        blacklist.get(retry_grid, 0.0),
+                        curr_time + EXHAUSTED_MOB_BLACKLIST_SECONDS,
+                    )
+                initial_click = current_target.get("initial_click")
+                if initial_click is not None:
+                    initial_grid = (
+                        int(initial_click[0] // 40),
+                        int(initial_click[1] // 40),
+                    )
+                    blacklist[initial_grid] = max(
+                        blacklist.get(initial_grid, 0.0),
+                        curr_time + EXHAUSTED_MOB_BLACKLIST_SECONDS,
+                    )
+                ignored_exhausted_marker = (tx, ty)
+                retry_context = None
+                print(
+                    f"[~] Exhausted caption still visible after "
+                    f"{EXHAUSTED_CAPTION_CONFIRM_SECONDS:.0f}s; skipping mob "
+                    f"at ({tx}, {ty}) for {EXHAUSTED_MOB_BLACKLIST_SECONDS:.0f}s."
+                )
+                current_target = None
+                confirmed_locked = False
+                idle_mark_check_needed = False
+                no_target_since = curr_time
             else:
-                exhausted_caption_clear_frames += 1
-                if exhausted_caption_clear_frames >= 2:
-                    exhausted_caption_armed = True
-
-        if current_target is not None and exhausted_caption_armed and caption_visible:
-            tx, ty = current_target["click_x"], current_target["click_y"]
-            grid_pos = (int(tx // 40), int(ty // 40))
-            blacklist[grid_pos] = max(
-                blacklist.get(grid_pos, 0.0),
-                curr_time + EXHAUSTED_MOB_BLACKLIST_SECONDS,
-            )
-            fail_counts.pop(grid_pos, None)
-            print(
-                f"[~] Exhausted caption found; skipping mob at ({tx}, {ty}) "
-                f"for {EXHAUSTED_MOB_BLACKLIST_SECONDS:.0f}s. Looking for another."
-            )
-            current_target = None
-            confirmed_locked = False
-            no_target_since = curr_time
-            exhausted_caption_armed = False
-            exhausted_caption_clear_frames = 0
+                print("[+] Exhausted caption cleared; keeping the current target.")
 
         if current_target is not None:
             tx, ty = current_target["click_x"], current_target["click_y"]
             has_red, updated_pos = has_red_square(frame, tx, ty)
+            if has_red and ignored_exhausted_marker is not None:
+                old_distance = np.hypot(
+                    updated_pos[0] - ignored_exhausted_marker[0],
+                    updated_pos[1] - ignored_exhausted_marker[1],
+                )
+                target_distance = np.hypot(updated_pos[0] - tx, updated_pos[1] - ty)
+                if old_distance < 140 and target_distance >= old_distance - 25:
+                    has_red = False
+                    updated_pos = None
+            if not has_red:
+                has_red, updated_pos = has_red_square(frame)
+                next_idle_mark_check_at = curr_time + IDLE_MARK_CHECK_INTERVAL
+                if has_red and ignored_exhausted_marker is not None:
+                    old_distance = np.hypot(
+                        updated_pos[0] - ignored_exhausted_marker[0],
+                        updated_pos[1] - ignored_exhausted_marker[1],
+                    )
+                    new_distance = np.hypot(updated_pos[0] - tx, updated_pos[1] - ty)
+                    if old_distance < 140 and new_distance >= old_distance - 25:
+                        has_red = False
+                        updated_pos = None
 
             if has_red:
                 last_red_seen_time = curr_time
+                idle_mark_check_needed = False
                 if updated_pos is not None:
                     # Dynamically follow moving mob
                     current_target["click_x"], current_target["click_y"] = updated_pos
@@ -1613,8 +1749,11 @@ def main():
 
                 if not confirmed_locked:
                     confirmed_locked = True
-                    grid_pos = (int(tx // 40), int(ty // 40))
-                    fail_counts.pop(grid_pos, None)
+                    retry_grid = current_target.get("retry_grid")
+                    if retry_grid is not None:
+                        fail_counts.pop(retry_grid, None)
+                    retry_context = None
+                    ignored_exhausted_marker = None
                     print(f"[*] Target locked with red square! Fighting at ({tx}, {ty})...")
             else:
                 if confirmed_locked:
@@ -1623,33 +1762,61 @@ def main():
                         print(f"[+] Red square gone for {curr_time - last_red_seen_time:.1f}s! Mob defeated. Searching next...")
                         current_target = None
                         confirmed_locked = False
+                        idle_mark_check_needed = False
                         no_target_since = curr_time
                         pickup_pending = True
                 elif curr_time - target_click_time > TARGET_LOCK_TIMEOUT:
-                    print(
-                        f"[-] No target lock after {TARGET_LOCK_TIMEOUT}s. "
-                        "Skipping this click location for 30.0s to avoid toggling its mark..."
-                    )
                     grid_pos = (int(tx // 40), int(ty // 40))
-                    blacklist[grid_pos] = curr_time + 30.0
-                    fail_counts.pop(grid_pos, None)
+                    retry_grid = current_target.get("retry_grid", grid_pos)
+                    failures = fail_counts.get(retry_grid, 0) + 1
+                    fail_counts[retry_grid] = failures
+                    if failures >= TARGET_RETRY_LIMIT:
+                        expires = curr_time + TARGET_RETRY_BLACKLIST_SECONDS
+                        blacklist[grid_pos] = expires
+                        blacklist[retry_grid] = expires
+                        fail_counts.pop(retry_grid, None)
+                        retry_context = None
+                        print(
+                            f"[-] No target lock after {failures} fresh-position attempts; "
+                            f"skipping nearby location for "
+                            f"{TARGET_RETRY_BLACKLIST_SECONDS:.0f}s."
+                        )
+                    else:
+                        retry_context = {
+                            "x": tx, "y": ty, "grid": retry_grid, "time": curr_time,
+                        }
+                        print(
+                            f"[-] No target lock after {TARGET_LOCK_TIMEOUT:.1f}s; "
+                            "checking a fresh mob position before retrying."
+                        )
                     current_target = None
                     confirmed_locked = False
+                    idle_mark_check_needed = False
                     no_target_since = curr_time
 
         # 2. If idle, search for new mob
         if current_target is None:
             # First check if a mob is ALREADY targeted/marked in the playfield!
             # In Rucoy, tapping an already-targeted mob CANCELS the attack, so never re-click it.
-            has_red, active_pos = has_red_square(frame)
-            active_grid = (
-                (int(active_pos[0] // 40), int(active_pos[1] // 40))
-                if active_pos is not None else None
-            )
-            if (
-                has_red and active_pos is not None and
-                curr_time >= blacklist.get(active_grid, 0.0)
+            has_red, active_pos = (False, None)
+            if idle_mark_check_needed or (
+                ignored_exhausted_marker is None and
+                curr_time >= next_idle_mark_check_at
             ):
+                has_red, active_pos = has_red_square(frame)
+                idle_mark_check_needed = False
+                next_idle_mark_check_at = curr_time + IDLE_MARK_CHECK_INTERVAL
+            if has_red and active_pos is not None:
+                if ignored_exhausted_marker is not None:
+                    old_distance = np.hypot(
+                        active_pos[0] - ignored_exhausted_marker[0],
+                        active_pos[1] - ignored_exhausted_marker[1],
+                    )
+                    if old_distance < 140:
+                        has_red = False
+                if has_red:
+                    ignored_exhausted_marker = None
+            if has_red and active_pos is not None:
                 ax, ay = active_pos
                 print(f"[*] Detected active target lock at ({ax}, {ay})! Adopting target...")
                 current_target = {
@@ -1662,6 +1829,7 @@ def main():
                 target_click_time = curr_time
                 last_red_seen_time = curr_time
                 confirmed_locked = True
+                retry_context = None
                 continue
 
             mobs = find_target_mobs(
@@ -1671,7 +1839,28 @@ def main():
 
             if mobs:
                 best = mobs[0]
+                if retry_context is not None:
+                    if curr_time - retry_context["time"] <= 5.0:
+                        nearby = min(
+                            mobs,
+                            key=lambda candidate: np.hypot(
+                                candidate["click_x"] - retry_context["x"],
+                                candidate["click_y"] - retry_context["y"],
+                            ),
+                        )
+                        retry_distance = np.hypot(
+                            nearby["click_x"] - retry_context["x"],
+                            nearby["click_y"] - retry_context["y"],
+                        )
+                        if retry_distance <= 180:
+                            best = nearby
+                            best["retry_grid"] = retry_context["grid"]
+                        else:
+                            retry_context = None
+                    else:
+                        retry_context = None
                 bx, by = best["click_x"], best["click_y"]
+                best.setdefault("retry_grid", (int(bx // 40), int(by // 40)))
                 dist = int(best["distance"])
                 score = best["score"]
                 scale = best["scale"]
@@ -1681,10 +1870,13 @@ def main():
                 print(f"    -> Clicking mob at ({bx}, {by}) [dist:{dist}px]")
 
                 current_target = best
-                target_click_time = curr_time
-                last_red_seen_time = curr_time
+                best["initial_click"] = (bx, by)
+                target_click_time = time.time()
+                last_red_seen_time = target_click_time
                 confirmed_locked = False
+                idle_mark_check_needed = False
                 no_target_since = curr_time
+                retry_context = None
                 time.sleep(0.04)
             else:
                 if curr_time - last_log_time > 5.0:
@@ -1726,7 +1918,6 @@ def main():
                 break
         else:
             time.sleep(0.05)
-
     if SHOW_PREVIEW:
         cv2.destroyAllWindows()
     print("[+] Bot stopped.")
