@@ -11,8 +11,11 @@ import numpy as np
 # ================================================================================
 # CONFIGURATION
 # ==============================================================================
-# Target mob name to hunt
-TARGET_MOB_NAME = "Zombie Lv.65"
+# Target profile to hunt
+TARGET_MOB_NAME = "Skeleton Lv.75"
+TARGET_TEMPLATE_NAME = "skeleton_lv75"
+TARGET_PURPLE_TEMPLATE_NAME = "purple_name_skeleton_lv75"
+MINIMAP_REFERENCE_NAME = "minimap-skeleton-layout"
 
 # True Background Mode via ADB (Recommended):
 # - 100% background: Emulator can stay behind your work/browser/games.
@@ -55,7 +58,10 @@ MOB_BODY_Y_OFFSET = 52
 PLAYER_DEADZONE_RADIUS = 60
 
 # Template matching minimum score
-MATCH_THRESHOLD = 0.55
+# The saved Skeleton Lv.75 label matches the live 1600x900 frames at roughly
+# 0.71 because the in-game outline and antialiasing vary.
+MATCH_THRESHOLD = 0.70
+MIN_NAME_TEMPLATE_OVERLAP = 0.65
 TARGET_SCAN_WIDTH = 1100
 UI_MATCH_THRESHOLD = 0.80
 BACK_ICON_MATCH_THRESHOLD = 0.86
@@ -69,9 +75,11 @@ TARGET_LOCK_TIMEOUT = 1.5
 TARGET_RETRY_LIMIT = 2
 TARGET_RETRY_BLACKLIST_SECONDS = 4.0
 IDLE_MARK_CHECK_INTERVAL = 1.0
+TARGET_POSITION_REFRESH_INTERVAL = 0.25
+TARGET_REACQUIRE_RADIUS = 180
 
 # Grace period (seconds) before confirming mob is defeated when red square drops (prevents flicker drops)
-TARGET_DEFEATED_GRACE_TIME = 0.70
+TARGET_DEFEATED_GRACE_TIME = 0.30
 EXHAUSTED_CAPTION_CONFIRM_SECONDS = 10.0
 EXHAUSTED_CAPTION_POLL_SECONDS = 0.25
 EXHAUSTED_MOB_BLACKLIST_SECONDS = 600.0
@@ -391,12 +399,11 @@ def send_click(adb_path, device_serial, game_hwnd, use_adb, x, y, synchronous=Fa
 def load_templates():
     """Load only templates used by combat targeting and UI recovery."""
     required = {
-        "zombie_lv65",
-        "zombie",
-        "purple_name_zombie_lv65",
+        TARGET_TEMPLATE_NAME,
+        TARGET_PURPLE_TEMPLATE_NAME,
         "minimapicon",
         "backicon",
-        "minimap-zombie-layout",
+        MINIMAP_REFERENCE_NAME,
         "pickup-available",
         "pickup-not-yet",
         "exhausted-caption",
@@ -986,7 +993,7 @@ def choose_minimap_destination(frame, alignment, safe_mask, player_screen, waypo
 
 def travel_via_minimap(adb_path, device_serial, game_hwnd, use_adb, templates):
     """Register the visible minimap, click one safe nearby waypoint, and close it."""
-    reference = templates.get("minimap-zombie-layout")
+    reference = templates.get(MINIMAP_REFERENCE_NAME)
     if reference is None:
         print("[!] Minimap travel disabled: full reference map is missing.")
         return False
@@ -997,13 +1004,11 @@ def travel_via_minimap(adb_path, device_serial, game_hwnd, use_adb, templates):
 
     state, icon_position = detect_game_ui(map_frame, templates)
     if state == "combat":
-        target_template = templates.get("zombie_lv65")
-        if target_template is None:
-            target_template = templates.get("zombie")
+        target_template = templates.get(TARGET_TEMPLATE_NAME)
         visible_targets = []
         if target_template is not None:
             visible_targets.append((target_template, "white"))
-        purple_template = templates.get("purple_name_zombie_lv65")
+        purple_template = templates.get(TARGET_PURPLE_TEMPLATE_NAME)
         if purple_template is not None:
             visible_targets.append((purple_template, "purple"))
         fh, fw = map_frame.shape[:2]
@@ -1249,7 +1254,9 @@ def find_target_mobs(frame, template, center_x, center_y, threshold=MATCH_THRESH
     left = int(fw * MARGIN_LEFT)
     right = int(fw * (1.0 - MARGIN_RIGHT))
 
-    playfield = frame[top:bot, left:right]
+    # Include edge labels in matching; the stricter click bounds below still
+    # keep taps out of the screen controls.
+    playfield = frame[top:bot, left:fw]
     if playfield.size == 0:
         return []
 
@@ -1277,7 +1284,10 @@ def find_target_mobs(frame, template, center_x, center_y, threshold=MATCH_THRESH
     def scan_scale(scale):
         combined_scale = scale * processing_scale
         scaled_color = (
-            cv2.resize(template, None, fx=combined_scale, fy=combined_scale)
+            cv2.resize(
+                template, None, fx=combined_scale, fy=combined_scale,
+                interpolation=cv2.INTER_NEAREST,
+            )
             if combined_scale != 1.0 else template
         )
         scaled = make_text_mask(scaled_color)
@@ -1293,7 +1303,12 @@ def find_target_mobs(frame, template, center_x, center_y, threshold=MATCH_THRESH
             px, py = pt
             frame_patch = text_pf[py:py + th, px:px + tw]
             shared_pixels = np.count_nonzero(cv2.bitwise_and(frame_patch, scaled))
-            if template_pixels == 0 or shared_pixels / template_pixels < 0.35:
+            observed_pixels = cv2.countNonZero(frame_patch)
+            if (
+                template_pixels == 0 or observed_pixels == 0 or
+                shared_pixels / template_pixels < MIN_NAME_TEMPLATE_OVERLAP or
+                shared_pixels / observed_pixels < MIN_NAME_TEMPLATE_OVERLAP
+            ):
                 continue
 
             x = int(round(px / processing_scale)) + left
@@ -1473,16 +1488,14 @@ def main():
 
     # 1. Load templates
     templates = load_templates()
-    template = templates.get("zombie_lv65")
-    if template is None:
-        template = templates.get("zombie")
+    template = templates.get(TARGET_TEMPLATE_NAME)
 
     if template is None:
-        print(f"[-] No template found in {TEMPLATE_DIR}!")
+        print(f"[-] Exact {TARGET_MOB_NAME} template not found in {TEMPLATE_DIR}!")
         return
 
     target_templates = [(template, "white")]
-    purple_template = templates.get("purple_name_zombie_lv65")
+    purple_template = templates.get(TARGET_PURPLE_TEMPLATE_NAME)
     if purple_template is not None:
         target_templates.append((purple_template, "purple"))
 
@@ -1531,7 +1544,7 @@ def main():
             best_score = mx
 
     if best_score < MATCH_THRESHOLD:
-        print(f"[!] Level-specific template score is {best_score:.2f}; keeping the saved Zombie Lv.65 template.")
+        print(f"[!] Level-specific template score is {best_score:.2f}; keeping the saved {TARGET_MOB_NAME} template.")
     else:
         print(f"[+] Template match verified (score: {best_score:.2f})")
 
@@ -1633,6 +1646,94 @@ def main():
         # Periodic cleanup of expired blacklist entries
         if blacklist and frame_count % 30 == 0:
             blacklist = {pos: exp for pos, exp in blacklist.items() if curr_time < exp}
+
+        # Check for a lock or mob before pickup and target-status work.
+        if current_target is None:
+            # In Rucoy, tapping an already-targeted mob cancels the attack.
+            has_red, active_pos = (False, None)
+            if idle_mark_check_needed or (
+                ignored_exhausted_marker is None and
+                curr_time >= next_idle_mark_check_at
+            ):
+                has_red, active_pos = has_red_square(frame)
+                idle_mark_check_needed = False
+                next_idle_mark_check_at = curr_time + IDLE_MARK_CHECK_INTERVAL
+            if has_red and active_pos is not None:
+                if ignored_exhausted_marker is not None:
+                    old_distance = np.hypot(
+                        active_pos[0] - ignored_exhausted_marker[0],
+                        active_pos[1] - ignored_exhausted_marker[1],
+                    )
+                    if old_distance < 140:
+                        has_red = False
+                if has_red:
+                    ignored_exhausted_marker = None
+            if has_red and active_pos is not None:
+                ax, ay = active_pos
+                print(f"[*] Detected active target lock at ({ax}, {ay})! Adopting target...")
+                current_target = {
+                    "click_x": ax,
+                    "click_y": ay,
+                    "distance": np.hypot(ax - cx, ay - cy),
+                    "score": 1.0,
+                    "scale": 1.0
+                }
+                target_click_time = curr_time
+                last_red_seen_time = curr_time
+                confirmed_locked = True
+                retry_context = None
+                continue
+
+            mobs = find_target_mobs(
+                frame, target_templates, cx, cy, MATCH_THRESHOLD,
+                blacklist=blacklist, curr_time=curr_time,
+            )
+
+            if mobs:
+                best = mobs[0]
+                if retry_context is not None:
+                    if curr_time - retry_context["time"] <= 5.0:
+                        nearby = min(
+                            mobs,
+                            key=lambda candidate: np.hypot(
+                                candidate["click_x"] - retry_context["x"],
+                                candidate["click_y"] - retry_context["y"],
+                            ),
+                        )
+                        retry_distance = np.hypot(
+                            nearby["click_x"] - retry_context["x"],
+                            nearby["click_y"] - retry_context["y"],
+                        )
+                        if retry_distance <= 180:
+                            best = nearby
+                            best["retry_grid"] = retry_context["grid"]
+                        else:
+                            retry_context = None
+                    else:
+                        retry_context = None
+                bx, by = best["click_x"], best["click_y"]
+                best.setdefault("retry_grid", (int(bx // 40), int(by // 40)))
+                dist = int(best["distance"])
+                score = best["score"]
+                scale = best["scale"]
+
+                send_click(adb_path, device_serial, game_hwnd, use_adb, bx, by)
+                print(f"[+] Found {len(mobs)} '{TARGET_MOB_NAME}' (score:{score:.2f} scale:{scale:.1f}x)")
+                print(f"    -> Clicking mob at ({bx}, {by}) [dist:{dist}px]")
+
+                current_target = best
+                best["initial_click"] = (bx, by)
+                best["last_position_refresh"] = curr_time
+                target_click_time = time.time()
+                last_red_seen_time = target_click_time
+                confirmed_locked = False
+                idle_mark_check_needed = False
+                no_target_since = curr_time
+                retry_context = None
+            else:
+                if curr_time - last_log_time > 5.0:
+                    print(f"[...] Scanning for '{TARGET_MOB_NAME}'... (frame #{frame_count}, res {fw}x{fh})")
+                    last_log_time = curr_time
 
         if pickup_pending:
             pickup_position = find_pickup_available(frame, templates)
@@ -1793,112 +1894,55 @@ def main():
                     confirmed_locked = False
                     idle_mark_check_needed = False
                     no_target_since = curr_time
-
-        # 2. If idle, search for new mob
-        if current_target is None:
-            # First check if a mob is ALREADY targeted/marked in the playfield!
-            # In Rucoy, tapping an already-targeted mob CANCELS the attack, so never re-click it.
-            has_red, active_pos = (False, None)
-            if idle_mark_check_needed or (
-                ignored_exhausted_marker is None and
-                curr_time >= next_idle_mark_check_at
-            ):
-                has_red, active_pos = has_red_square(frame)
-                idle_mark_check_needed = False
-                next_idle_mark_check_at = curr_time + IDLE_MARK_CHECK_INTERVAL
-            if has_red and active_pos is not None:
-                if ignored_exhausted_marker is not None:
-                    old_distance = np.hypot(
-                        active_pos[0] - ignored_exhausted_marker[0],
-                        active_pos[1] - ignored_exhausted_marker[1],
+                # Track the mob from each fresh frame until the lock marker appears.
+                elif (
+                    curr_time - current_target.get(
+                        "last_position_refresh", target_click_time
+                    ) >= TARGET_POSITION_REFRESH_INTERVAL
+                ):
+                    current_target["last_position_refresh"] = curr_time
+                    fresh_mobs = find_target_mobs(
+                        frame, target_templates, cx, cy, MATCH_THRESHOLD,
+                        blacklist=blacklist, curr_time=curr_time,
                     )
-                    if old_distance < 140:
-                        has_red = False
-                if has_red:
-                    ignored_exhausted_marker = None
-            if has_red and active_pos is not None:
-                ax, ay = active_pos
-                print(f"[*] Detected active target lock at ({ax}, {ay})! Adopting target...")
-                current_target = {
-                    "click_x": ax,
-                    "click_y": ay,
-                    "distance": np.hypot(ax - cx, ay - cy),
-                    "score": 1.0,
-                    "scale": 1.0
-                }
-                target_click_time = curr_time
-                last_red_seen_time = curr_time
-                confirmed_locked = True
-                retry_context = None
-                continue
-
-            mobs = find_target_mobs(
-                frame, target_templates, cx, cy, MATCH_THRESHOLD,
-                blacklist=blacklist, curr_time=curr_time,
-            )
-
-            if mobs:
-                best = mobs[0]
-                if retry_context is not None:
-                    if curr_time - retry_context["time"] <= 5.0:
-                        nearby = min(
-                            mobs,
+                    if fresh_mobs:
+                        fresh_target = min(
+                            fresh_mobs,
                             key=lambda candidate: np.hypot(
-                                candidate["click_x"] - retry_context["x"],
-                                candidate["click_y"] - retry_context["y"],
+                                candidate["click_x"] - tx,
+                                candidate["click_y"] - ty,
                             ),
                         )
-                        retry_distance = np.hypot(
-                            nearby["click_x"] - retry_context["x"],
-                            nearby["click_y"] - retry_context["y"],
+                        target_shift = np.hypot(
+                            fresh_target["click_x"] - tx,
+                            fresh_target["click_y"] - ty,
                         )
-                        if retry_distance <= 180:
-                            best = nearby
-                            best["retry_grid"] = retry_context["grid"]
-                        else:
-                            retry_context = None
-                    else:
-                        retry_context = None
-                bx, by = best["click_x"], best["click_y"]
-                best.setdefault("retry_grid", (int(bx // 40), int(by // 40)))
-                dist = int(best["distance"])
-                score = best["score"]
-                scale = best["scale"]
+                        if target_shift <= TARGET_REACQUIRE_RADIUS:
+                            current_target.update({
+                                key: fresh_target[key]
+                                for key in (
+                                    "nx", "ny", "nw", "nh", "click_x", "click_y",
+                                    "distance", "score", "scale",
+                                )
+                            })
 
-                send_click(adb_path, device_serial, game_hwnd, use_adb, bx, by)
-                print(f"[+] Found {len(mobs)} '{TARGET_MOB_NAME}' (score:{score:.2f} scale:{scale:.1f}x)")
-                print(f"    -> Clicking mob at ({bx}, {by}) [dist:{dist}px]")
-
-                current_target = best
-                best["initial_click"] = (bx, by)
-                target_click_time = time.time()
-                last_red_seen_time = target_click_time
-                confirmed_locked = False
-                idle_mark_check_needed = False
-                no_target_since = curr_time
-                retry_context = None
-                time.sleep(0.04)
-            else:
-                if curr_time - last_log_time > 5.0:
-                    print(f"[...] Scanning for '{TARGET_MOB_NAME}'... (frame #{frame_count}, res {fw}x{fh})")
-                    last_log_time = curr_time
-
-                idle_duration = curr_time - no_target_since
-                if (
-                    ENABLE_MINIMAP_WALK and
-                    idle_duration >= MINIMAP_IDLE_DELAY and
-                    curr_time - last_minimap_time >= MINIMAP_COOLDOWN
-                ):
-                    print(
-                        f"[~] No '{TARGET_MOB_NAME}' in vision for "
-                        f"{idle_duration:.1f}s -> registering minimap waypoint..."
-                    )
-                    travel_via_minimap(
-                        adb_path, device_serial, game_hwnd, use_adb, templates
-                    )
-                    now = time.time()
-                    last_minimap_time = now
-                    no_target_since = now
+        if current_target is None:
+            idle_duration = curr_time - no_target_since
+            if (
+                ENABLE_MINIMAP_WALK and
+                idle_duration >= MINIMAP_IDLE_DELAY and
+                curr_time - last_minimap_time >= MINIMAP_COOLDOWN
+            ):
+                print(
+                    f"[~] No '{TARGET_MOB_NAME}' in vision for "
+                    f"{idle_duration:.1f}s -> registering minimap waypoint..."
+                )
+                travel_via_minimap(
+                    adb_path, device_serial, game_hwnd, use_adb, templates
+                )
+                now = time.time()
+                last_minimap_time = now
+                no_target_since = now
 
         # 3. Preview window
         if SHOW_PREVIEW:
@@ -1916,8 +1960,8 @@ def main():
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 print("[+] Quit key pressed.")
                 break
-        else:
-            time.sleep(0.05)
+        elif not use_adb:
+            time.sleep(0.01)
     if SHOW_PREVIEW:
         cv2.destroyAllWindows()
     print("[+] Bot stopped.")

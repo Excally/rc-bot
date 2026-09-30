@@ -1,0 +1,78 @@
+"""Load zone-specific target and minimap template selections."""
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+PROFILE_FILE = Path(__file__).resolve().parent.parent / "zone_profiles.json"
+
+
+@dataclass(frozen=True)
+class ZoneProfile:
+    key: str
+    target_name: str
+    target_template_key: str
+    target_purple_template_key: Optional[str]
+    minimap_template_key: str
+
+    @property
+    def template_keys(self) -> tuple[str, ...]:
+        keys = [self.target_template_key, self.minimap_template_key]
+        if self.target_purple_template_key:
+            keys.append(self.target_purple_template_key)
+        return tuple(keys)
+
+
+@dataclass(frozen=True)
+class ProfileSettings:
+    active_profile: str
+    profiles: dict[str, ZoneProfile]
+
+
+def _template_key(value: object, field_name: str, profile_key: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"Profile '{profile_key}' needs a non-empty '{field_name}'.")
+    key = value.strip()
+    if Path(key).name != key or Path(key).suffix:
+        raise ValueError(
+            f"Profile '{profile_key}' field '{field_name}' must be a template filename stem, without a path or extension."
+        )
+    return key
+
+
+def load_profile_settings(path: Path = PROFILE_FILE) -> ProfileSettings:
+    """Load profiles from JSON and validate all configured template keys."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("The profile file must contain a JSON object.")
+    raw_profiles = data.get("profiles")
+    if not isinstance(raw_profiles, dict) or not raw_profiles:
+        raise ValueError("The profile file needs a non-empty 'profiles' object.")
+
+    profiles: dict[str, ZoneProfile] = {}
+    for key, raw in raw_profiles.items():
+        if not isinstance(key, str) or not key.strip() or not isinstance(raw, dict):
+            raise ValueError("Each profile must have a non-empty string key and an object value.")
+        key = key.strip()
+        target_name = raw.get("target_name")
+        if not isinstance(target_name, str) or not target_name.strip():
+            raise ValueError(f"Profile '{key}' needs a non-empty 'target_name'.")
+        purple_raw = raw.get("purple_name_template")
+        purple_key = (
+            _template_key(purple_raw, "purple_name_template", key)
+            if purple_raw is not None else None
+        )
+        profiles[key] = ZoneProfile(
+            key=key,
+            target_name=target_name.strip(),
+            target_template_key=_template_key(raw.get("name_template"), "name_template", key),
+            target_purple_template_key=purple_key,
+            minimap_template_key=_template_key(raw.get("minimap_template"), "minimap_template", key),
+        )
+
+    active_profile = data.get("active_profile")
+    if not isinstance(active_profile, str) or active_profile not in profiles:
+        raise ValueError("'active_profile' must name one of the profiles in the profile file.")
+    return ProfileSettings(active_profile=active_profile, profiles=profiles)

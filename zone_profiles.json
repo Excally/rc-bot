@@ -1,0 +1,17 @@
+{
+  "active_profile": "skeleton-lv75",
+  "profiles": {
+    "skeleton-lv75": {
+      "target_name": "Skeleton Lv.75",
+      "name_template": "skeleton_lv75",
+      "purple_name_template": "purple_name_skeleton_lv75",
+      "minimap_template": "minimap-skeleton-layout"
+    },
+    "zombie-lv65": {
+      "target_name": "Zombie Lv.65",
+      "name_template": "zombie_lv65",
+      "purple_name_template": "purple_name_zombie_lv65",
+      "minimap_template": "minimap-zombie-layout"
+    }
+  }
+}
