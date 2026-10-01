@@ -48,12 +48,12 @@ class BotConfig:
     idle_mark_check_interval: float = 1.0
     target_position_refresh_interval: float = 0.25
     target_reacquire_radius: float = 90
-    # A red lock marker can flicker during attack animations.  Use the
-    # target nameplate as a second identity check so a stale marker cannot
-    # hold a defeated target forever.
+    # Do not trust a lingering red outline after the target nameplate vanishes.
+    target_entity_loss_timeout: float = 2.0
+    # A red lock marker can flicker during attack animations.
     target_red_loss_timeout: float = 240.0
     ui_check_interval: float = 0.35
-    target_stall_timeout: float = 30.0
+    target_stall_timeout: float = 180.0
     target_stall_blacklist_seconds: float = 10.0
     exhausted_caption_confirm_seconds: float = 10.0
     exhausted_caption_poll_seconds: float = 0.25

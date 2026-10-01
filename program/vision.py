@@ -50,13 +50,12 @@ class FrameVision:
         self._red_mask: Optional[np.ndarray] = None
         self._caption_cache: Any = None
         self._target_mask_frame: Any = None
-        self._target_masks: dict[str, np.ndarray] = {}
-
-    @staticmethod
-    def minimap_white_mask(image: np.ndarray) -> np.ndarray:
-        channels = image.astype(np.int16)
-        spread = channels.max(axis=2) - channels.min(axis=2)
-        return ((channels.min(axis=2) >= 220) & (spread <= 35)).astype(np.uint8) * 255
+        self._target_masks: dict[
+            tuple[str, tuple[int, int, int, int]], np.ndarray
+        ] = {}
+        self._target_template_masks: dict[
+            tuple[int, str, float], tuple[np.ndarray, np.ndarray]
+        ] = {}
 
     @staticmethod
     def is_disconnected(frame: Optional[np.ndarray]) -> bool:
@@ -156,55 +155,74 @@ class FrameVision:
     @staticmethod
     def purple_text_mask(image: np.ndarray) -> np.ndarray:
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        return (
-            (hsv[:, :, 0] >= 138) & (hsv[:, :, 0] <= 154)
-            & (hsv[:, :, 1] >= 90) & (hsv[:, :, 2] >= 170)
-        ).astype(np.uint8) * 255
+        return cv2.inRange(hsv, (138, 90, 170), (154, 255, 255))
 
     def player_center(self, frame: np.ndarray) -> Optional[tuple[int, int]]:
-        """Find the player's bright-green body near the camera center.
+        """Find the player's bright green or cyan body near the camera center.
 
-        Green health bars and the green player name are much thinner than the
-        body sprite, so connected-component size and shape separate the player
-        from those UI elements.  The result is used for target ranking only;
-        the red lock marker remains the authority once combat starts.
+        The avatar palette spans green through cyan. Green health bars and the
+        player name are much thinner than the body sprite, so connected-
+        component size and shape separate the player from those UI elements.
+        The result is used for target ranking only; the red lock marker remains
+        the authority once combat starts.
         """
         fh, fw = frame.shape[:2]
         roi_x1, roi_x2 = int(fw * 0.30), int(fw * 0.70)
         roi_y1, roi_y2 = int(fh * 0.20), int(fh * 0.80)
         roi = frame[roi_y1:roi_y2, roi_x1:roi_x2]
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        green = (
-            (hsv[:, :, 0] >= 45) & (hsv[:, :, 0] <= 85)
-            & (hsv[:, :, 1] >= 120) & (hsv[:, :, 2] >= 120)
-        ).astype(np.uint8)
-        count, _, stats, centroids = cv2.connectedComponentsWithStats(green, 8)
-        screen_center = np.array([fw / 2.0, fh / 2.0])
-        choices: list[tuple[float, tuple[int, int]]] = []
+        body_colors = cv2.inRange(hsv, (45, 120, 120), (125, 255, 255))
+        count, _, stats, centroids = cv2.connectedComponentsWithStats(body_colors, 8)
+        scale_x, scale_y = fw / 1600.0, fh / 900.0
+        min_area, max_area = 500 * scale_x * scale_y, 7000 * scale_x * scale_y
+        min_width, max_width = 25 * scale_x, 130 * scale_x
+        min_height, max_height = 25 * scale_y, 130 * scale_y
+        center_x, center_y = fw / 2.0, fh / 2.0
+        best_key = (float("inf"), float("inf"), float("inf"))
+        best_point: Optional[tuple[int, int]] = None
         for index in range(1, count):
             x, y, width, height, area = stats[index]
-            if not (500 <= area <= 7000 and 25 <= width <= 130 and 25 <= height <= 130):
+            if not (
+                min_area <= area <= max_area
+                and min_width <= width <= max_width
+                and min_height <= height <= max_height
+            ):
                 continue
             if not (0.35 <= width / max(1, height) <= 2.5):
                 continue
-            point = centroids[index] + np.array([roi_x1, roi_y1])
-            distance = float(np.linalg.norm(point - screen_center))
-            choices.append((distance, (int(round(point[0])), int(round(point[1])))))
-        return min(choices)[1] if choices else None
+            point_x, point_y = centroids[index]
+            screen_x, screen_y = point_x + roi_x1, point_y + roi_y1
+            dx, dy = screen_x - center_x, screen_y - center_y
+            candidate_key = (dx * dx + dy * dy, screen_x, screen_y)
+            if candidate_key < best_key:
+                best_key = candidate_key
+                best_point = (int(round(screen_x)), int(round(screen_y)))
+        return best_point
 
     def find_targets(
         self, frame: np.ndarray, templates: list[tuple[np.ndarray, str]], center_x: int, center_y: int,
         blacklist: Optional[dict[tuple[int, int], float]] = None, now: float = 0.0,
+        *, search_center: Optional[tuple[int, int]] = None, search_radius: Optional[int] = None,
+        include_deadzone: bool = True,
     ) -> list[TargetMatch]:
         # Match every name at native scale first.  The slower scale fallback is
         # used only when the complete primary pass found nothing, just like the
         # original bot's two-tier scanner.
         matches: list[TargetMatch] = []
         for template, color in templates:
-            matches.extend(self._find_one_target(frame, template, color, center_x, center_y, blacklist, now, allow_fallback=False))
+            matches.extend(self._find_one_target(
+                frame, template, color, center_x, center_y, blacklist, now,
+                allow_fallback=False, search_center=search_center,
+                search_radius=search_radius, include_deadzone=include_deadzone,
+            ))
         if not matches:
             for template, color in templates:
-                matches.extend(self._find_one_target(frame, template, color, center_x, center_y, blacklist, now, allow_fallback=True, fallback_only=True))
+                matches.extend(self._find_one_target(
+                    frame, template, color, center_x, center_y, blacklist, now,
+                    allow_fallback=True, fallback_only=True,
+                    search_center=search_center, search_radius=search_radius,
+                    include_deadzone=include_deadzone,
+                ))
         # White and purple versions can describe the same nametag.
         unique: list[TargetMatch] = []
         for candidate in sorted(matches, key=lambda item: item["distance"]):
@@ -220,12 +238,21 @@ class FrameVision:
         self, frame: np.ndarray, template: np.ndarray, name_color: str, center_x: int, center_y: int,
         blacklist: Optional[dict[tuple[int, int], float]], now: float,
         allow_fallback: bool = True, fallback_only: bool = False,
+        search_center: Optional[tuple[int, int]] = None, search_radius: Optional[int] = None,
+        include_deadzone: bool = True,
     ) -> list[TargetMatch]:
         cfg = self.config
         fh, fw = frame.shape[:2]
         top, bottom = int(fh * cfg.margin_top), int(fh * (1.0 - cfg.margin_bottom))
         left, right = int(fw * cfg.margin_left), int(fw * (1.0 - cfg.margin_right))
-        playfield = frame[top:bottom, left:fw]
+        scan_left, scan_top, scan_right, scan_bottom = left, top, fw, bottom
+        if search_center is not None and search_radius is not None:
+            search_x, search_y = search_center
+            scan_left = max(scan_left, search_x - search_radius)
+            scan_top = max(scan_top, search_y - search_radius)
+            scan_right = min(scan_right, search_x + search_radius)
+            scan_bottom = min(scan_bottom, search_y + search_radius)
+        playfield = frame[scan_top:scan_bottom, scan_left:scan_right]
         if playfield.size == 0:
             return []
 
@@ -234,14 +261,15 @@ class FrameVision:
         if self._target_mask_frame is not frame:
             self._target_mask_frame = frame
             self._target_masks = {}
-        text_mask = self._target_masks.get(name_color)
+        mask_key = (name_color, (scan_left, scan_top, scan_right, scan_bottom))
+        text_mask = self._target_masks.get(mask_key)
         if text_mask is None:
             search_image = (
                 cv2.resize(playfield, None, fx=processing_scale, fy=processing_scale, interpolation=cv2.INTER_NEAREST)
                 if processing_scale < 1.0 else playfield
             )
             text_mask = mask_builder(search_image)
-            self._target_masks[name_color] = text_mask
+            self._target_masks[mask_key] = text_mask
         if cv2.countNonZero(text_mask) == 0:
             return []
 
@@ -249,11 +277,20 @@ class FrameVision:
 
         def scan(scale: float) -> None:
             combined = scale * processing_scale
-            scaled_color = (
-                cv2.resize(template, None, fx=combined, fy=combined, interpolation=cv2.INTER_NEAREST)
-                if combined != 1.0 else template
-            )
-            scaled = mask_builder(scaled_color)
+            cache_key = (id(template), name_color, combined)
+            cached_template = self._target_template_masks.get(cache_key)
+            scaled = cached_template[1] if cached_template is not None else None
+            if scaled is None:
+                scaled_color = (
+                    cv2.resize(template, None, fx=combined, fy=combined, interpolation=cv2.INTER_NEAREST)
+                    if combined != 1.0 else template
+                )
+                scaled = mask_builder(scaled_color)
+                # Target templates are immutable during a run, so avoid
+                # resizing and rebuilding their binary masks on every frame.
+                if len(self._target_template_masks) >= 32:
+                    self._target_template_masks.clear()
+                self._target_template_masks[cache_key] = (template, scaled)
             th, tw = scaled.shape[:2]
             if th >= text_mask.shape[0] or tw >= text_mask.shape[1] or th < 3 or tw < 3:
                 return
@@ -269,8 +306,8 @@ class FrameVision:
                     or shared / observed < cfg.min_name_template_overlap
                 ):
                     continue
-                x = int(round(px / processing_scale)) + left
-                y = int(round(py / processing_scale)) + top
+                x = int(round(px / processing_scale)) + scan_left
+                y = int(round(py / processing_scale)) + scan_top
                 native_w = max(1, int(round(template.shape[1] * scale)))
                 native_h = max(1, int(round(template.shape[0] * scale)))
                 if any(abs(x - item["nx"]) < 30 and abs(y - item["ny"]) < 15 for item in matches):
@@ -278,7 +315,7 @@ class FrameVision:
                 click_x = x + native_w // 2
                 click_y = y + native_h + int(cfg.mob_body_y_offset * scale)
                 distance = float(np.hypot(click_x - center_x, click_y - center_y))
-                if distance < cfg.player_deadzone_radius:
+                if not include_deadzone and distance < cfg.player_deadzone_radius:
                     continue
                 grid = (int(click_x // 40), int(click_y // 40))
                 if blacklist and grid in blacklist and now < blacklist[grid]:
@@ -412,8 +449,9 @@ class FrameVision:
         fh, fw = frame.shape[:2]
         if self._caption_cache is None or self._caption_cache[0] is not template:
             hsv = cv2.cvtColor(template, cv2.COLOR_BGR2HSV)
-            hue = hsv[:, :, 0]
-            mask = (((hue <= 10) | (hue >= 170)) & (hsv[:, :, 1] >= 110) & (hsv[:, :, 2] >= 90)).astype(np.uint8) * 255
+            low_red = cv2.inRange(hsv, (0, 110, 90), (10, 255, 255))
+            high_red = cv2.inRange(hsv, (170, 110, 90), (179, 255, 255))
+            mask = cv2.bitwise_or(low_red, high_red)
             points = cv2.findNonZero(mask)
             if points is None:
                 return False
@@ -425,8 +463,9 @@ class FrameVision:
         x0, x1, y0, y1 = int(fw * 0.05), int(fw * 0.95), int(fh * 0.50), int(fh * 0.85)
         region = frame[y0:y1, x0:x1]
         hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
-        hue = hsv[:, :, 0]
-        red_mask = (((hue <= 10) | (hue >= 170)) & (hsv[:, :, 1] >= 110) & (hsv[:, :, 2] >= 90)).astype(np.uint8) * 255
+        low_red = cv2.inRange(hsv, (0, 110, 90), (10, 255, 255))
+        high_red = cv2.inRange(hsv, (170, 110, 90), (179, 255, 255))
+        red_mask = cv2.bitwise_or(low_red, high_red)
         screen_scale = fw / 1600.0
         processing_scale = min(0.5, 800.0 / max(1, region.shape[1]))
         if processing_scale < 1.0:

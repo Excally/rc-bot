@@ -402,10 +402,43 @@ class RucoyBot:
                 has_red, position = False, None
 
         if has_red and position is not None:
-            state.idle_mark_check_needed = False
             target["click_x"], target["click_y"] = position
             tx, ty = position
             target["red_loss_since"] = None
+
+        if state.confirmed_locked:
+            refresh_interval = max(0.05, cfg.target_position_refresh_interval)
+            if now - target.get("last_entity_check", 0.0) >= refresh_interval:
+                target["last_entity_check"] = now
+                match = self._find_locked_entity(frame, cx, cy, target, now)
+                if match is not None:
+                    target["last_entity_seen_time"] = now
+                    # When the red outline flickers, keep tracking from the
+                    # target's visible nameplate instead of its stale point.
+                    if not has_red:
+                        target["click_x"], target["click_y"] = match["click_x"], match["click_y"]
+                        tx, ty = target["click_x"], target["click_y"]
+                elif (
+                    now - target.get("last_entity_seen_time", state.target_click_time)
+                    >= cfg.target_entity_loss_timeout
+                    and state.exhausted_caption_check_at is None
+                ):
+                    print(
+                        f"[+] Target nameplate missing for {cfg.target_entity_loss_timeout:.1f}s; "
+                        f"releasing stale lock at ({tx}, {ty}) and searching again."
+                    )
+                    state.current_target = None
+                    state.confirmed_locked = False
+                    state.locked_since = None
+                    state.consecutive_exhausted = 0
+                    state.idle_mark_check_needed = False
+                    state.no_target_since = now
+                    state.pickup_pending = True
+                    state.ignored_stale_marker = (tx, ty)
+                    return
+
+        if has_red and position is not None:
+            state.idle_mark_check_needed = False
             if not state.confirmed_locked:
                 last_red = target.get("red_last_seen", now)
                 observations = target.get("red_observations", 0)
@@ -468,6 +501,28 @@ class RucoyBot:
             state.consecutive_exhausted = 0
             state.idle_mark_check_needed = False
             state.no_target_since = now
+
+    def _find_locked_entity(
+        self, frame: np.ndarray, cx: int, cy: int, target: TargetMatch, now: float,
+    ) -> Optional[TargetMatch]:
+        """Find this target's nameplate close to its current screen position."""
+        assert self.vision is not None
+        match_radius = max(60, int(self.config.target_reacquire_radius))
+        search_radius = max(150, match_radius)
+        tx, ty = target["click_x"], target["click_y"]
+        matches = self.vision.find_targets(
+            frame, self.target_templates, cx, cy, now=now,
+            search_center=(tx, ty), search_radius=search_radius, include_deadzone=True,
+        )
+        if not matches:
+            return None
+        nearest = min(
+            matches,
+            key=lambda match: np.hypot(match["click_x"] - tx, match["click_y"] - ty),
+        )
+        distance = np.hypot(nearest["click_x"] - tx, nearest["click_y"] - ty)
+        return nearest if distance <= match_radius else None
+
     def _abandon_stalled_target(self, tx: int, ty: int, now: float) -> None:
         """Release a lock that has survived too long without defeating its mob."""
         state, cfg = self.state, self.config

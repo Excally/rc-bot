@@ -10,14 +10,27 @@ import numpy as np
 
 from .config import BotConfig
 from .device import InputDevice
-from .models import RetryContext, TargetMatch
 from .vision import FrameVision, TemplateStore
 
 @dataclass
 class MinimapRoute:
     signature: tuple[Any, ...]
-    waypoints: tuple[tuple[int, int], ...]
+    waypoints: tuple[tuple[float, float], ...]
     index: int
+
+
+@dataclass(frozen=True)
+class CellMap:
+    """A color-coded map reduced to exact, uniform logical cells."""
+
+    walls: np.ndarray
+    outside: np.ndarray
+    annotations: np.ndarray
+    safe_mask: np.ndarray
+    cell_pixels: int = 21
+
+
+MAP_CELL_PIXELS = 21
 
 
 class MinimapNavigator:
@@ -33,70 +46,93 @@ class MinimapNavigator:
         self.templates = templates
         self.minimap_template_key = minimap_template_key
         self.safe_mask: Optional[np.ndarray] = None
-        self.waypoints: list[tuple[int, int]] = []
+        self.waypoints: list[tuple[float, float]] = []
+        self.cell_map: Optional[CellMap] = None
         self.reference_id: Optional[int] = None
         self.route: Optional[MinimapRoute] = None
         self.last_route_target: Optional[tuple[int, int]] = None
 
     @staticmethod
-    def _build_safe_mask(reference: np.ndarray) -> np.ndarray:
-        walls = FrameVision.minimap_white_mask(reference)
-        contours, hierarchy = cv2.findContours(walls, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return np.zeros(walls.shape, dtype=np.uint8)
-        outer_index = max(range(len(contours)), key=lambda index: cv2.contourArea(contours[index]))
-        outer_area = cv2.contourArea(contours[outer_index])
-        # Some older reference captures contain disconnected white room outlines rather than one enclosing boundary.
-        # In that layout the largest contour is only a small room, so filling it produces an empty/near-empty
-        # route mask and every destination is rejected. Use the linework bounding box as the traversable map,
-        # then remove the walls below.
-        image_area = walls.shape[0] * walls.shape[1]
-        if outer_area < image_area * 0.20:
-            ys, xs = np.where(walls > 0)
-            if len(xs) == 0:
-                return np.zeros(walls.shape, dtype=np.uint8)
-            pad = 12
-            x1, x2 = max(0, int(xs.min()) - pad), min(walls.shape[1], int(xs.max()) + pad + 1)
-            y1, y2 = max(0, int(ys.min()) - pad), min(walls.shape[0], int(ys.max()) + pad + 1)
-            safe = np.zeros(walls.shape, dtype=np.uint8)
-            safe[y1:y2, x1:x2] = 255
-        else:
-            safe = np.zeros(walls.shape, dtype=np.uint8)
-            cv2.drawContours(safe, [contours[outer_index]], -1, 255, thickness=-1)
-        blocked = cv2.dilate(walls, np.ones((9, 9), np.uint8), iterations=1)
-        if outer_area >= image_area * 0.20 and hierarchy is not None:
-            for index, contour in enumerate(contours):
-                parent = int(hierarchy[0][index][3])
-                area = cv2.contourArea(contour)
-                if parent < 0 or area < 1000 or area >= outer_area * 0.5:
-                    continue
-                cv2.drawContours(blocked, [contour], -1, 255, thickness=-1)
-        safe[blocked > 0] = 0
-        return cv2.erode(safe, np.ones((5, 5), np.uint8), iterations=1)
+    def _cell_labels(reference: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Read the skeleton's un-antialiased 21px cell palette.
+
+        White is a wall, red is outside, and yellow is a hand-marked cell.
+        Yellow is retained as annotation metadata but never drives alignment
+        or player detection. Every remaining cell is floor.
+        """
+        if reference is None or reference.ndim != 3 or reference.shape[2] < 3:
+            raise ValueError("The minimap template must be a BGR color image.")
+        height, width = reference.shape[:2]
+        if height % MAP_CELL_PIXELS or width % MAP_CELL_PIXELS:
+            raise ValueError(
+                f"The minimap template must use {MAP_CELL_PIXELS}x{MAP_CELL_PIXELS} pixel cells."
+            )
+        cell_blocks = reference.reshape(
+            height // MAP_CELL_PIXELS, MAP_CELL_PIXELS,
+            width // MAP_CELL_PIXELS, MAP_CELL_PIXELS, 3,
+        )
+        cell_colors = cell_blocks[:, MAP_CELL_PIXELS // 2, :, MAP_CELL_PIXELS // 2, :]
+        uniform = np.all(
+            cell_blocks == cell_colors[:, None, :, None, :], axis=(1, 3, 4)
+        )
+        if not np.all(uniform):
+            bad = int(uniform.size - np.count_nonzero(uniform))
+            raise ValueError(
+                f"The minimap template has {bad} antialiased or non-uniform cells; "
+                "each map cell must be a solid 21x21 color block."
+            )
+
+        blue, green, red = [cell_colors[:, :, channel].astype(np.int16) for channel in range(3)]
+        spread = np.maximum(np.maximum(blue, green), red) - np.minimum(np.minimum(blue, green), red)
+        walls = (np.minimum(np.minimum(blue, green), red) >= 220) & (spread <= 35)
+        outside = (red >= 170) & (red > green * 1.35) & (red > blue * 1.35)
+        annotations = (green >= 170) & (red >= 150) & (blue <= 100)
+        return walls, outside, annotations
+
+    @classmethod
+    def _build_cell_map(cls, reference: np.ndarray) -> CellMap:
+        walls, outside, annotations = cls._cell_labels(reference)
+        wall_u8 = walls.astype(np.uint8) * 255
+        contours, _ = cv2.findContours(wall_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        height, width = walls.shape
+        safe = np.zeros((height, width), dtype=np.uint8)
+        if contours:
+            outer = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(outer) >= height * width * 0.15:
+                cv2.drawContours(safe, [outer], -1, 255, thickness=cv2.FILLED)
+        if cv2.countNonZero(safe) == 0:
+            raise ValueError("The minimap template needs a clear enclosing white wall boundary.")
+        # Cell-sized clearance keeps taps away from wall tiles. Annotation
+        # cells inherit the surrounding floor; red outside cells stay blocked.
+        blocked = cv2.dilate(wall_u8, np.ones((3, 3), np.uint8), iterations=1)
+        safe[(blocked > 0) | outside] = 0
+        if cv2.countNonZero(safe) == 0:
+            raise ValueError("The minimap template contains no safe floor cells.")
+        return CellMap(walls, outside, annotations, safe)
 
     @staticmethod
-    def build_waypoints(safe_mask: np.ndarray, grid_step: int = 120) -> list[tuple[int, int]]:
+    def build_waypoints(safe_mask: np.ndarray, grid_step: int = 6) -> list[tuple[float, float]]:
+        """Create a map-cell sweep independent of the image's pixel dimensions."""
         if safe_mask is None or safe_mask.size == 0:
             return []
         height, width = safe_mask.shape[:2]
-        waypoints: list[tuple[int, int]] = []
-        radius, half_step = max(12, grid_step // 3), max(1, grid_step // 2)
-        # Sweep columns instead of rows.  The reference contains long
-        # horizontal rooms; a row-first sweep can keep the character moving
-        # sideways for many taps before it changes level.  Alternating column
-        # direction still covers the whole safe area while forcing regular
-        # vertical progress.
+        waypoints: list[tuple[float, float]] = []
+        radius = max(1, grid_step // 3)
+        half_step = max(1, grid_step // 2)
         for column, x in enumerate(range(half_step, width, grid_step)):
-            column_points: list[tuple[int, int]] = []
+            column_points: list[tuple[float, float]] = []
             for y in range(half_step, height, grid_step):
-                x1, y1, x2, y2 = max(0, x - radius), max(0, y - radius), min(width, x + radius + 1), min(height, y + radius + 1)
-                local = safe_mask[y1:y2, x1:x2]
-                local_y, local_x = np.where(local > 0)
-                if len(local_x) == 0:
+                x1, y1 = max(0, x - radius), max(0, y - radius)
+                x2, y2 = min(width, x + radius + 1), min(height, y + radius + 1)
+                local_y, local_x = np.where(safe_mask[y1:y2, x1:x2] > 0)
+                if not len(local_x):
                     continue
                 distances = (local_x + x1 - x) ** 2 + (local_y + y1 - y) ** 2
                 nearest = int(np.argmin(distances))
-                column_points.append((int(local_x[nearest] + x1), int(local_y[nearest] + y1)))
+                column_points.append((
+                    float(local_x[nearest] + x1) + 0.5,
+                    float(local_y[nearest] + y1) + 0.5,
+                ))
             if column % 2:
                 column_points.reverse()
             for point in column_points:
@@ -105,180 +141,219 @@ class MinimapNavigator:
         return waypoints
 
     @staticmethod
-    def _geometry_score(frame_mask: np.ndarray, scaled_reference: np.ndarray, origin: tuple[int, int]) -> float:
-        fh, fw = frame_mask.shape[:2]
-        sh, sw = scaled_reference.shape[:2]
-        ox, oy = origin
-        x1, y1, x2, y2 = max(0, ox), max(0, oy), min(fw, ox + sw), min(fh, oy + sh)
-        if x2 <= x1 or y2 <= y1:
-            return 0.0
-        expected = (scaled_reference[y1 - oy:y2 - oy, x1 - ox:x2 - ox] > 0).astype(np.uint8)
-        observed = (frame_mask[y1:y2, x1:x2] > 0).astype(np.uint8)
-        if cv2.countNonZero(expected) < 3000 or cv2.countNonZero(observed) < 3000:
-            return 0.0
-        kernel = np.ones((7, 7), np.uint8)
-        expected_near, observed_near = cv2.dilate(expected, kernel, iterations=1) > 0, cv2.dilate(observed, kernel, iterations=1) > 0
-        recall = float(np.count_nonzero(expected & observed_near)) / max(1, np.count_nonzero(expected))
-        precision = float(np.count_nonzero(observed & expected_near)) / max(1, np.count_nonzero(observed))
-        return 2.0 * recall * precision / (recall + precision) if recall + precision else 0.0
+    def _screen_cell_grid(
+        integral: np.ndarray, frame_shape: tuple[int, int], cell_px: float,
+        phase_x: float, phase_y: float,
+    ) -> np.ndarray:
+        """Sample white occupancy once per logical cell using an integral image."""
+        height, width = frame_shape
+        cols = max(0, int(np.floor((width - phase_x) / cell_px)))
+        rows = max(0, int(np.floor((height - phase_y) / cell_px)))
+        if rows == 0 or cols == 0:
+            return np.zeros((rows, cols), dtype=np.uint8)
+        sample = max(3, int(round(cell_px * 0.72)))
+        centers_x = phase_x + (np.arange(cols, dtype=np.float32) + 0.5) * cell_px
+        centers_y = phase_y + (np.arange(rows, dtype=np.float32) + 0.5) * cell_px
+        x1 = np.rint(centers_x - sample / 2).astype(np.int32)
+        y1 = np.rint(centers_y - sample / 2).astype(np.int32)
+        x2, y2 = x1 + sample, y1 + sample
+        x1c, x2c = np.clip(x1, 0, width), np.clip(x2, 0, width)
+        y1c, y2c = np.clip(y1, 0, height), np.clip(y2, 0, height)
+        sums = (
+            integral[y2c[:, None], x2c[None, :]]
+            - integral[y1c[:, None], x2c[None, :]]
+            - integral[y2c[:, None], x1c[None, :]]
+            + integral[y1c[:, None], x1c[None, :]]
+        )
+        return (sums >= sample * sample * 0.30).astype(np.uint8)
 
     @staticmethod
-    def _visible_reference_pixels(
-        frame_mask: np.ndarray, scaled_reference: np.ndarray, origin: tuple[int, int]
-    ) -> tuple[int, int]:
-        """Return expected white pixels visible in the frame and total reference pixels.
-
-        A partial view is normal because the full route is larger than the
-        1600x900 game viewport.  This metric lets us reject tiny repeated
-        patches without requiring the whole reference to be on screen.
-        """
-        fh, fw = frame_mask.shape[:2]
-        sh, sw = scaled_reference.shape[:2]
-        ox, oy = origin
-        x1, y1, x2, y2 = max(0, ox), max(0, oy), min(fw, ox + sw), min(fh, oy + sh)
-        if x2 <= x1 or y2 <= y1:
-            return 0, int(cv2.countNonZero(scaled_reference))
-        visible = scaled_reference[y1 - oy:y2 - oy, x1 - ox:x2 - ox]
-        return int(cv2.countNonZero(visible)), int(cv2.countNonZero(scaled_reference))
-
-    def _refine_y(self, frame_mask: np.ndarray, scaled_reference: np.ndarray, origin: tuple[int, int]) -> tuple[tuple[int, int], float]:
-        ox, oy = origin
-        def candidate(offset_y: int) -> tuple[float, int]:
-            candidate_origin = (ox, offset_y)
-            visible, _ = self._visible_reference_pixels(frame_mask, scaled_reference, candidate_origin)
-            if visible < self.config.minimap_min_visible_reference_pixels:
-                return 0.0, offset_y
-            return self._geometry_score(frame_mask, scaled_reference, candidate_origin), offset_y
-
-        coarse = [candidate(oy + offset) for offset in range(-360, 361, 16)]
-        _, best_y = max(coarse)
-        fine = [candidate(candidate_y) for candidate_y in range(best_y - 16, best_y + 17, 2)]
-        geometry, refined_y = max(fine)
-        return (ox, refined_y), geometry
+    def _score_origin(
+        integral: np.ndarray, frame_shape: tuple[int, int], cell_map: CellMap,
+        cell_px: float, origin: tuple[float, float],
+    ) -> tuple[float, float, int]:
+        """Compare map-wall cells with a candidate screen placement."""
+        frame_h, frame_w = frame_shape
+        map_h, map_w = cell_map.walls.shape
+        sample = max(3, int(round(cell_px * 0.72)))
+        xs = np.rint(origin[0] + (np.arange(map_w) + 0.5) * cell_px).astype(np.int32)
+        ys = np.rint(origin[1] + (np.arange(map_h) + 0.5) * cell_px).astype(np.int32)
+        x1, y1 = xs - sample // 2, ys - sample // 2
+        x2, y2 = x1 + sample, y1 + sample
+        visible_x = (x1 >= 0) & (x2 <= frame_w)
+        visible_y = (y1 >= 0) & (y2 <= frame_h)
+        visible = visible_y[:, None] & visible_x[None, :]
+        if not np.any(visible):
+            return 0.0, 0.0, 0
+        x1c, x2c = np.clip(x1, 0, frame_w), np.clip(x2, 0, frame_w)
+        y1c, y2c = np.clip(y1, 0, frame_h), np.clip(y2, 0, frame_h)
+        sums = (
+            integral[y2c[:, None], x2c[None, :]]
+            - integral[y1c[:, None], x2c[None, :]]
+            - integral[y2c[:, None], x1c[None, :]]
+            + integral[y1c[:, None], x1c[None, :]]
+        )
+        observed = sums >= sample * sample * 0.30
+        expected = cell_map.walls & visible
+        expected_count = int(np.count_nonzero(expected))
+        total_walls = max(1, int(np.count_nonzero(cell_map.walls)))
+        if expected_count == 0:
+            return 0.0, 0.0, 0
+        hits = int(np.count_nonzero(expected & observed))
+        precision_area = visible & ~cell_map.outside & ~cell_map.annotations
+        observed_count = int(np.count_nonzero(observed & precision_area))
+        recall = hits / expected_count
+        precision = hits / max(1, observed_count)
+        geometry = 2.0 * recall * precision / (recall + precision) if recall + precision else 0.0
+        return geometry, expected_count / total_walls, expected_count
 
     def align(self, frame: np.ndarray, reference: np.ndarray) -> Optional[dict[str, Any]]:
-        frame_mask = self.vision.minimap_white_mask(frame)
-        if cv2.countNonZero(frame_mask) < 12000:
+        """Register the 21px cell map against white wall cells in the live view.
+
+        Matching runs on a small logical-cell grid, so frame resolution does
+        not multiply template work. Red outside cells and yellow annotations
+        never participate in registration.
+        """
+        if self.reference_id == id(reference) and self.cell_map is not None:
+            cell_map = self.cell_map
+        else:
+            try:
+                cell_map = self._build_cell_map(reference)
+            except ValueError as error:
+                print(f"[!] Minimap grid rejected: {error}")
+                return None
+            self.cell_map = cell_map
+            self.safe_mask = cell_map.safe_mask
+            self.waypoints = self.build_waypoints(cell_map.safe_mask)
+            self.reference_id = id(reference)
+        white_mask = cv2.inRange(frame, (220, 220, 220), (255, 255, 255))
+        if cv2.countNonZero(white_mask) < 120:
             return None
-        downsample = 0.25
-        search = cv2.resize(frame_mask, None, fx=downsample, fy=downsample, interpolation=cv2.INTER_NEAREST)
-        reference_mask = self.vision.minimap_white_mask(reference)
-        patch_w, patch_h = min(180, search.shape[1] - 4), min(180, search.shape[0] - 4)
-        if patch_w < 120 or patch_h < 120:
+        integral = cv2.integral(white_mask // 255, sdepth=cv2.CV_32S)
+        frame_h, frame_w = frame.shape[:2]
+        map_h, map_w = cell_map.walls.shape
+        patch_h = min(28, map_h - 2)
+        patch_w = min(32, map_w - 2)
+        if patch_h < 12 or patch_w < 12:
             return None
-        raw: list[tuple[float, float, tuple[int, int]]] = []
-        for scale in (0.92, 0.96, 1.0, 1.04, 1.08):
-            scaled = cv2.resize(reference_mask, None, fx=scale * downsample, fy=scale * downsample, interpolation=cv2.INTER_NEAREST)
-            scaled_h, scaled_w = scaled.shape[:2]
-            if scaled_w < patch_w or scaled_h < patch_h:
-                continue
-            x_starts = sorted({0, max(0, (scaled_w - patch_w) // 2), max(0, scaled_w - patch_w)})
-            y_remaining = max(0, scaled_h - patch_h)
-            y_starts = sorted({int(round(y_remaining * fraction)) for fraction in (0.0, 0.5, 1.0)})
-            for crop_y in y_starts:
-                for crop_x in x_starts:
-                    patch = scaled[crop_y:crop_y + patch_h, crop_x:crop_x + patch_w]
-                    if cv2.countNonZero(patch) < 3000:
+
+        # Distributed patches cast translation votes. Several separated
+        # patches must agree, which rejects repeated nameplates and HUD tiles.
+        patch_positions = sorted({
+            (x, y)
+            for y in (0, max(0, (map_h - patch_h) // 2), map_h - patch_h)
+            for x in (0, max(0, (map_w - patch_w) // 2), map_w - patch_w)
+        })
+        patches: list[tuple[int, int, np.ndarray]] = []
+        for x, y in patch_positions:
+            patch = cell_map.walls[y:y + patch_h, x:x + patch_w].astype(np.float32)
+            wall_count = int(np.count_nonzero(patch))
+            if wall_count >= 10 and wall_count <= patch.size * 0.55:
+                patches.append((x, y, patch))
+        if not patches:
+            return None
+
+        # The game and the authored skeleton map both use exactly 21 pixels
+        # per cell; keeping that fixed avoids unnecessary scale searches.
+        scales = (float(MAP_CELL_PIXELS),)
+        votes: dict[tuple[int, int, int], list[float]] = {}
+        candidate_origins: dict[tuple[int, int, int], tuple[float, float, float]] = {}
+        for scale_index, cell_px in enumerate(scales):
+            phase_values = (cell_px * 0.20, cell_px * 0.70)
+            for phase_y in phase_values:
+                for phase_x in phase_values:
+                    grid = self._screen_cell_grid(
+                        integral, (frame_h, frame_w), cell_px, phase_x, phase_y
+                    )
+                    if grid.shape[0] < patch_h or grid.shape[1] < patch_w:
                         continue
-                    _, score, _, location = cv2.minMaxLoc(cv2.matchTemplate(search, patch, cv2.TM_CCOEFF_NORMED))
-                    origin = (int(round((location[0] - crop_x) / downsample)), int(round((location[1] - crop_y) / downsample)))
-                    raw.append((float(score), float(scale), origin))
-        if not raw:
+                    for ref_x, ref_y, patch in patches:
+                        response = cv2.matchTemplate(
+                            grid.astype(np.float32), patch, cv2.TM_CCOEFF_NORMED
+                        )
+                        for _ in range(1):
+                            _, score, _, location = cv2.minMaxLoc(response)
+                            if not np.isfinite(score):
+                                break
+                            origin_x = phase_x + (location[0] - ref_x) * cell_px
+                            origin_y = phase_y + (location[1] - ref_y) * cell_px
+                            bin_size = max(5.0, cell_px / 3.0)
+                            key = (
+                                scale_index,
+                                int(round(origin_x / bin_size)),
+                                int(round(origin_y / bin_size)),
+                            )
+                            votes.setdefault(key, []).append(float(score))
+                            candidate_origins[key] = (origin_x, origin_y, cell_px)
+                            lx, ly = location
+                            x1, x2 = max(0, lx - 3), min(response.shape[1], lx + 4)
+                            y1, y2 = max(0, ly - 3), min(response.shape[0], ly + 4)
+                            response[y1:y2, x1:x2] = -1.0
+
+        if not votes:
             return None
-        raw.sort(key=lambda item: item[0], reverse=True)
-        candidates: list[tuple[float, float, tuple[int, int], float]] = []
-        for score, scale, origin in raw:
-            if any(
-                abs(origin[0] - kept[2][0]) <= 10
-                and abs(origin[1] - kept[2][1]) <= 10
-                and abs(scale - kept[1]) <= 0.045
-                for kept in candidates
-            ):
-                continue
-            scaled_reference = cv2.resize(reference_mask, None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
-            geometry = self._geometry_score(frame_mask, scaled_reference, origin)
-            visible_pixels, total_reference_pixels = self._visible_reference_pixels(frame_mask, scaled_reference, origin)
-            visible_fraction = visible_pixels / max(1, total_reference_pixels)
-            if (
-                geometry > 0
-                and visible_pixels >= self.config.minimap_min_visible_reference_pixels
-                and visible_fraction >= self.config.minimap_min_visible_reference_fraction
-            ):
-                candidates.append((score, scale, origin, geometry))
-                if len(candidates) >= 8:
-                    break
+        ranked = sorted(
+            votes,
+            key=lambda key: (len(votes[key]), float(np.mean(votes[key]))),
+            reverse=True,
+        )[:8]
+        candidates: list[dict[str, Any]] = []
+        for key in ranked:
+            approx_x, approx_y, cell_px = candidate_origins[key]
+            # Refine translation around the grid vote at two-pixel steps.
+            best_local: Optional[dict[str, Any]] = None
+            for offset_y in (-3, 0, 3):
+                for offset_x in (-3, 0, 3):
+                    origin = (approx_x + offset_x, approx_y + offset_y)
+                    geometry, coverage, visible_cells = self._score_origin(
+                        integral, (frame_h, frame_w), cell_map, cell_px, origin
+                    )
+                    candidate = {
+                        "geometry": geometry,
+                        "coverage": coverage,
+                        "visible_cells": visible_cells,
+                        "origin": origin,
+                        "scale": cell_px,
+                        "score": float(np.mean(votes[key])),
+                    }
+                    if best_local is None or geometry > best_local["geometry"]:
+                        best_local = candidate
+            if best_local is not None:
+                # Multiple patch votes at essentially the same placement are
+                # one alignment, not competing matches for the confidence gap.
+                if any(
+                    abs(best_local["origin"][0] - item["origin"][0]) < cell_px * 0.45
+                    and abs(best_local["origin"][1] - item["origin"][1]) < cell_px * 0.45
+                    and abs(cell_px - item["scale"]) < 1.0
+                    for item in candidates
+                ):
+                    continue
+                candidates.append(best_local)
         if not candidates:
             return None
-        candidates.sort(key=lambda item: (item[3], item[0]), reverse=True)
-        refined_candidates: list[tuple[float, float, tuple[int, int], float]] = []
-        for candidate_score, candidate_scale, candidate_origin, _ in candidates[:2]:
-            candidate_reference = cv2.resize(
-                reference_mask, None, fx=candidate_scale, fy=candidate_scale,
-                interpolation=cv2.INTER_NEAREST,
-            )
-            refined_origin, refined_geometry = self._refine_y(
-                frame_mask, candidate_reference, candidate_origin
-            )
-            refined_candidates.append((
-                candidate_score, candidate_scale, refined_origin, refined_geometry
-            ))
-        refined_candidates.sort(key=lambda item: (item[3], item[0]), reverse=True)
-        score, scale, origin, geometry = refined_candidates[0]
-        second_geometry = refined_candidates[1][3] if len(refined_candidates) > 1 else 0.0
-        scaled_reference = cv2.resize(
-            reference_mask, None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST
-        )
-        gap = geometry - second_geometry
-        visible_pixels, total_reference_pixels = self._visible_reference_pixels(frame_mask, scaled_reference, origin)
-        visible_fraction = visible_pixels / max(1, total_reference_pixels)
-        # `score` is kept for diagnostics, but it compares screenshots whose
-        # backgrounds can differ dramatically.  Geometry plus coverage is the
-        # authoritative test for the white route linework.
+        candidates.sort(key=lambda item: (item["geometry"], item["score"]), reverse=True)
+        best = candidates[0]
+        second_geometry = candidates[1]["geometry"] if len(candidates) > 1 else 0.0
+        gap = best["geometry"] - second_geometry
+        minimum_cells = max(20, int(np.ceil(
+            self.config.minimap_min_visible_reference_pixels / (MAP_CELL_PIXELS ** 2)
+        )))
         valid = (
-            geometry >= self.config.minimap_geometry_min_score
+            best["geometry"] >= self.config.minimap_geometry_min_score
             and gap >= self.config.minimap_align_min_gap
-            and visible_pixels >= self.config.minimap_min_visible_reference_pixels
-            and visible_fraction >= self.config.minimap_min_visible_reference_fraction
+            and best["visible_cells"] >= minimum_cells
+            and best["coverage"] >= self.config.minimap_min_visible_reference_fraction
         )
-        result = {
+        return {
             "valid": valid,
-            "score": score,
-            "geometry": geometry,
+            "score": best["score"],
+            "geometry": best["geometry"],
             "gap": gap,
-            "coverage": visible_fraction,
-            "visible_pixels": visible_pixels,
-            "scale": scale,
-            "origin": origin,
+            "coverage": best["coverage"],
+            "visible_pixels": best["visible_cells"] * MAP_CELL_PIXELS ** 2,
+            "scale": best["scale"],
+            "origin": tuple(int(round(value)) for value in best["origin"]),
         }
-        return result
-
-    def _best_alignment(
-        self, frame: np.ndarray, references: list[tuple[str, np.ndarray]]
-    ) -> tuple[Optional[dict[str, Any]], Optional[str]]:
-        """Try every known map layout and keep the strongest registration."""
-        best: Optional[dict[str, Any]] = None
-        best_name: Optional[str] = None
-        for name, reference in references:
-            candidate = self.align(frame, reference)
-            if candidate is None:
-                continue
-            candidate_valid = bool(candidate.get("valid"))
-            best_valid = bool(best and best.get("valid"))
-            candidate_key = (
-                candidate_valid,
-                float(candidate.get("geometry", 0.0)),
-                float(candidate.get("coverage", 0.0)),
-                float(candidate.get("gap", 0.0)),
-            )
-            best_key = (
-                best_valid,
-                float(best.get("geometry", 0.0)) if best else 0.0,
-                float(best.get("coverage", 0.0)) if best else 0.0,
-                float(best.get("gap", 0.0)) if best else 0.0,
-            )
-            if best is None or candidate_key > best_key:
-                best, best_name = candidate, name
-        return best, best_name
 
     @staticmethod
     def player_marker(frame: np.ndarray) -> Optional[tuple[int, int]]:
@@ -304,7 +379,7 @@ class MinimapNavigator:
         alignment: dict[str, Any],
         safe_mask: np.ndarray,
         player: tuple[int, int],
-        waypoints: list[tuple[int, int]],
+        waypoints: list[tuple[float, float]],
         farthest: bool = False,
     ) -> Optional[tuple[int, int]]:
         if not alignment or not alignment.get("valid") or safe_mask is None or player is None or not waypoints:
@@ -315,11 +390,10 @@ class MinimapNavigator:
         ref_h, ref_w = safe_mask.shape[:2]
         if not (0 <= map_x < ref_w and 0 <= map_y < ref_h and safe_mask[int(map_y), int(map_x)] > 0):
             return None
-        step = 8
-        ys, xs = np.where(safe_mask[::step, ::step] > 0)
+        ys, xs = np.where(safe_mask > 0)
         if len(xs) == 0:
             return None
-        ref_xs, ref_ys = xs * step + step // 2, ys * step + step // 2
+        ref_xs, ref_ys = xs.astype(np.float32) + 0.5, ys.astype(np.float32) + 0.5
         screen_xs, screen_ys = ox + ref_xs * scale, oy + ref_ys * scale
         fh, fw = frame.shape[:2]
         margin_x, margin_y = fw * (1.0 - self.config.minimap_safe_view_fraction) / 2.0, fh * (1.0 - self.config.minimap_safe_view_fraction) / 2.0
@@ -341,7 +415,11 @@ class MinimapNavigator:
             # route cursor, especially after a failsafe jump.  Re-anchor it
             # instead of continuing a stale same-row sweep.
             current_index = int(self.route.index)
-            if np.hypot(points[current_index, 0] - map_x, points[current_index, 1] - map_y) > max(150.0, self.config.minimap_max_click_distance):
+            reanchor_distance = max(
+                8.0,
+                self.config.minimap_max_click_distance * fw / 1600.0 / max(scale, 0.1),
+            )
+            if np.hypot(points[current_index, 0] - map_x, points[current_index, 1] - map_y) > reanchor_distance:
                 self.route.index = int(np.argmin(np.hypot(points[:, 0] - map_x, points[:, 1] - map_y)))
         if farthest:
             index = int(np.argmax(np.where(visible, distances, -np.inf)))
@@ -353,7 +431,11 @@ class MinimapNavigator:
         current = int(self.route.index)
         target_index = (current + 1) % len(points)
         target_x, target_y = points[target_index]
-        if np.hypot(target_x - map_x, target_y - map_y) < max(70.0, self.config.minimap_min_click_distance / max(scale, 0.1)):
+        arrival_distance = max(
+            2.0,
+            self.config.minimap_min_click_distance * fw / 1600.0 / max(scale, 0.1),
+        )
+        if np.hypot(target_x - map_x, target_y - map_y) < arrival_distance:
             current = target_index
             self.route.index = current
             target_index = (current + 1) % len(points)
@@ -362,7 +444,7 @@ class MinimapNavigator:
         after = np.hypot(target_x - ref_xs, target_y - ref_ys)
         preferred = (self.config.minimap_min_click_distance + self.config.minimap_max_click_distance) * 0.5 * fw / 1600.0
         scores = before - after
-        scores = scores * 1000.0 - np.abs(distances - preferred)
+        scores = scores * scale * 1000.0 - np.abs(distances - preferred)
         scores[~visible] = -np.inf
         index = int(np.argmax(scores))
         self.last_route_target = (int(round(target_x)), int(round(target_y)))
@@ -370,8 +452,7 @@ class MinimapNavigator:
 
     def travel(self, *, farthest: bool = False, keep_open_seconds: float = 0.0) -> bool:
         reference_image = self.templates.get(self.minimap_template_key)
-        references = [(self.minimap_template_key, reference_image)] if reference_image is not None else []
-        if not references:
+        if reference_image is None:
             print(f"[!] Minimap travel disabled: reference '{self.minimap_template_key}' is missing.")
             return False
         frame = self.device.capture()
@@ -379,7 +460,7 @@ class MinimapNavigator:
             return False
         state, icon = self.vision.ui_state(frame)
         alignment: Optional[dict[str, Any]] = None
-        reference_name: Optional[str] = None
+        reference_name = self.minimap_template_key
         if state == "combat":
             if icon is None or not self.device.click(*icon):
                 return False
@@ -396,16 +477,15 @@ class MinimapNavigator:
                 if state == "disconnected":
                     break
                 if state == "minimap":
-                    candidate, candidate_name = self._best_alignment(frame, references)
+                    candidate = self.align(frame, reference_image)
                     if candidate is not None and candidate.get("valid"):
                         alignment = candidate
-                        reference_name = candidate_name
                         break
         if state != "minimap":
             print(f"[!] Minimap travel skipped: UI state is {state}.")
             return False
         if alignment is None:
-            alignment, reference_name = self._best_alignment(frame, references)
+            alignment = self.align(frame, reference_image)
         if not alignment or not alignment.get("valid"):
             details = alignment or {}
             return self._fail(icon, f"[!] Minimap alignment rejected (match {details.get('score', 0.0):.2f}, geometry {details.get('geometry', 0.0):.2f}, coverage {details.get('coverage', 0.0):.2f}, gap {details.get('gap', 0.0):.2f}); no movement tap sent.")
@@ -415,8 +495,12 @@ class MinimapNavigator:
         player = self.player_marker(frame)
         if player is None:
             return self._fail(icon, "[!] Minimap player marker was not found; no movement tap sent.")
-        if self.reference_id != id(reference):
-            self.safe_mask = self._build_safe_mask(reference)
+        if self.reference_id != id(reference) or self.cell_map is None:
+            try:
+                self.cell_map = self._build_cell_map(reference)
+            except ValueError as error:
+                return self._fail(icon, f"[!] Minimap grid rejected: {error}")
+            self.safe_mask = self.cell_map.safe_mask
             self.waypoints = self.build_waypoints(self.safe_mask)
             self.reference_id = id(reference)
         destination = self.destination(frame, alignment, self.safe_mask, player, self.waypoints, farthest=farthest)
