@@ -42,19 +42,15 @@ class BotConfig:
     white_text_min_channel: int = 190
     white_text_max_channel_spread: int = 50
 
-    target_lock_timeout: float = 1.5
-    target_retry_limit: int = 2
-    target_retry_blacklist_seconds: float = 4.0
     idle_mark_check_interval: float = 1.0
     target_position_refresh_interval: float = 0.25
     target_reacquire_radius: float = 90
     # Do not trust a lingering red outline after the target nameplate vanishes.
     target_entity_loss_timeout: float = 2.0
-    # A red lock marker can flicker during attack animations.
-    target_red_loss_timeout: float = 240.0
+    # Release quickly when the exact marker disappears; a surviving nameplate
+    # alone is not enough to keep a target locked.
+    target_red_loss_timeout: float = 1.5
     ui_check_interval: float = 0.35
-    target_stall_timeout: float = 180.0
-    target_stall_blacklist_seconds: float = 10.0
     exhausted_caption_confirm_seconds: float = 10.0
     exhausted_caption_poll_seconds: float = 0.25
     exhausted_mob_blacklist_seconds: float = 600.0

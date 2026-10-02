@@ -10,7 +10,7 @@ import numpy as np
 from .config import BotConfig, CONFIG
 from .device import InputDevice
 from .exceptions import BotQuit, RepeatedOutputReset
-from .models import RetryContext, TargetMatch
+from .models import TargetMatch
 from .navigation import MinimapNavigator
 from .profiles import ZoneProfile, load_profile_settings
 from .state import BotState
@@ -89,7 +89,7 @@ class RucoyBot:
         print(f"[+] Background: {'YES (Can stay behind other windows)' if self.device.use_adb else 'Window visible'}")
         print(f"[+] Movement: Registered minimap waypoints ({'enabled' if self.config.enable_minimap_walk else 'disabled'})")
         print(f"[+] Hitbox Offset: {self.config.mob_body_y_offset}px below nametag (lowered for clean hits)")
-        print(f"[+] Target lock check: {self.config.target_lock_timeout:.1f}s; retry blacklist after {self.config.target_retry_limit} misses ({self.config.target_retry_blacklist_seconds:.0f}s)")
+        print("[+] Target marker check: waiting for the exact marked.png outline; nearest visible Skeleton first")
         print(f"[+] Exhaustion failsafe: {self.config.exhausted_travel_trigger_count} consecutive exhausted targets -> farthest minimap point, hold {self.config.exhausted_travel_hold_seconds:.0f}s")
         preview_status = "ON (Press q in preview window to exit)" if self.config.show_preview else "OFF (Press Ctrl+C in terminal to exit)"
         print(f"[+] Preview: {preview_status}")
@@ -191,7 +191,6 @@ class RucoyBot:
             state.failed_recovery_count = 0
         state.current_target = None
         state.confirmed_locked = False
-        state.locked_since = None
         state.idle_mark_check_needed = True
         state.no_target_since = now
         state.last_ui_back_time = now
@@ -239,46 +238,31 @@ class RucoyBot:
         if has_red and position is not None and state.ignored_exhausted_marker is not None:
             if np.hypot(position[0] - state.ignored_exhausted_marker[0], position[1] - state.ignored_exhausted_marker[1]) < 140:
                 has_red = False
-        if has_red and position is not None:
-            state.ignored_exhausted_marker = None
-            state.ignored_stale_marker = None
-            print(f"[*] Detected active target lock at ({position[0]}, {position[1]})! Adopting target...")
-            state.current_target = {
-                "click_x": position[0], "click_y": position[1],
-                "distance": np.hypot(position[0] - cx, position[1] - cy),
-                "score": 1.0, "scale": 1.0,
-                "last_entity_check": now,
-                "last_entity_seen_time": now,
-            }
-            state.target_click_time = now
-            state.confirmed_locked = True
-            state.locked_since = now
-            state.retry_context = None
-            return
         mobs = self.vision.find_targets(frame, self.target_templates, cx, cy, state.blacklist, now)
         if not mobs:
             if now - state.last_log_time > 5.0:
                 print(f"[...] Scanning for '{self.profile.target_name}'... (frame #{state.frame_count}, res {frame.shape[1]}x{frame.shape[0]})")
                 state.last_log_time = now
             return
+        # find_targets sorts by player distance first; match score only breaks
+        # distance ties, so a farther but sharper nameplate cannot win.
         best = mobs[0]
-        if state.retry_context is not None:
-            retry = state.retry_context
-            if now - retry["time"] <= 5.0:
-                nearby = min(mobs, key=lambda candidate: np.hypot(candidate["click_x"] - retry["x"], candidate["click_y"] - retry["y"]))
-                if np.hypot(nearby["click_x"] - retry["x"], nearby["click_y"] - retry["y"]) <= 180:
-                    # Retrying a failed position is allowed only when it is
-                    # still the closest visible mob.  This prevents a stale
-                    # retry from overriding a newly detected nearer target.
-                    if nearby["distance"] <= best["distance"]:
-                        best = nearby
-                        best["retry_grid"] = retry["grid"]
-                else:
-                    state.retry_context = None
-            else:
-                state.retry_context = None
         bx, by = best["click_x"], best["click_y"]
         best.setdefault("retry_grid", (int(bx // 40), int(by // 40)))
+        if has_red and position is not None:
+            marker_gap = np.hypot(position[0] - bx, position[1] - by)
+            if marker_gap <= cfg.target_reacquire_radius:
+                state.ignored_exhausted_marker = None
+                state.ignored_stale_marker = None
+                print(f"[*] Detected marked.png on the nearest Skeleton at ({position[0]}, {position[1]}); adopting target...")
+                best["click_x"], best["click_y"] = position
+                best["last_entity_check"], best["last_entity_seen_time"] = now, now
+                state.current_target = best
+                state.target_click_time = now
+                state.confirmed_locked = True
+                return
+            # An exact mark on a farther/unknown mob must not override the
+            # nearest-nameplate rule while starting or recovering the bot.
         if not self.device.click(bx, by):
             state.no_target_since = now
             print(f"[!] Could not tap the selected {self.profile.target_name} at ({bx}, {by}); retrying detection.")
@@ -291,10 +275,8 @@ class RucoyBot:
         state.ignored_stale_marker = None
         state.target_click_time = now
         state.confirmed_locked = False
-        state.locked_since = None
         state.idle_mark_check_needed = False
         state.no_target_since = now
-        state.retry_context = None
 
     def _check_exhausted_caption(self, frame: np.ndarray, now: float) -> None:
         state, cfg = self.state, self.config
@@ -323,9 +305,7 @@ class RucoyBot:
                 for grid in ((int(tx // 40), int(ty // 40)), target.get("retry_grid"), tuple(int(value // 40) for value in target.get("initial_click", (tx, ty)))):
                     if grid is not None:
                         state.blacklist[grid] = max(state.blacklist.get(grid, 0.0), expiry)
-                state.fail_counts.pop(target.get("retry_grid"), None)
                 state.ignored_exhausted_marker = (tx, ty)
-                state.retry_context = None
                 state.consecutive_exhausted += 1
                 print(f"[~] Exhausted caption still visible after {cfg.exhausted_caption_confirm_seconds:.0f}s; skipping mob at ({tx}, {ty}) for {cfg.exhausted_mob_blacklist_seconds:.0f}s.")
                 if state.consecutive_exhausted >= max(1, cfg.exhausted_travel_trigger_count):
@@ -336,7 +316,6 @@ class RucoyBot:
                     )
                 state.current_target = None
                 state.confirmed_locked = False
-                state.locked_since = None
                 state.idle_mark_check_needed = False
                 state.no_target_since = now
             else:
@@ -379,16 +358,8 @@ class RucoyBot:
         tx, ty = target["click_x"], target["click_y"]
 
         # Check the active lock locally first, then globally if the mob moved
-        # outside the small crop. A missing marker is not a reason to adopt a
-        # different mob; it starts the short red-loss timer below.
-        if (
-            state.confirmed_locked
-            and state.locked_since is not None
-            and now - state.locked_since >= cfg.target_stall_timeout
-        ):
-            self._abandon_stalled_target(tx, ty, now)
-            return
-
+        # outside the small crop. A confirmed marker stays locked as long as
+        # the marker remains visible, regardless of fight duration.
         has_red, position = self.vision.red_square(
             frame, (tx, ty), radius=int(cfg.target_reacquire_radius)
         )
@@ -406,36 +377,54 @@ class RucoyBot:
             tx, ty = position
             target["red_loss_since"] = None
 
-        if state.confirmed_locked:
-            refresh_interval = max(0.05, cfg.target_position_refresh_interval)
-            if now - target.get("last_entity_check", 0.0) >= refresh_interval:
-                target["last_entity_check"] = now
-                match = self._find_locked_entity(frame, cx, cy, target, now)
-                if match is not None:
-                    target["last_entity_seen_time"] = now
-                    # When the red outline flickers, keep tracking from the
-                    # target's visible nameplate instead of its stale point.
-                    if not has_red:
-                        target["click_x"], target["click_y"] = match["click_x"], match["click_y"]
-                        tx, ty = target["click_x"], target["click_y"]
-                elif (
-                    now - target.get("last_entity_seen_time", state.target_click_time)
-                    >= cfg.target_entity_loss_timeout
-                    and state.exhausted_caption_check_at is None
-                ):
-                    print(
-                        f"[+] Target nameplate missing for {cfg.target_entity_loss_timeout:.1f}s; "
-                        f"releasing stale lock at ({tx}, {ty}) and searching again."
-                    )
-                    state.current_target = None
-                    state.confirmed_locked = False
-                    state.locked_since = None
-                    state.consecutive_exhausted = 0
-                    state.idle_mark_check_needed = False
-                    state.no_target_since = now
-                    state.pickup_pending = True
-                    state.ignored_stale_marker = (tx, ty)
-                    return
+        refresh_interval = max(0.05, cfg.target_position_refresh_interval)
+        if now - target.get("last_entity_check", 0.0) >= refresh_interval:
+            target["last_entity_check"] = now
+            match = self._find_locked_entity(frame, cx, cy, target, now)
+            if match is not None:
+                target["last_entity_seen_time"] = now
+                # When the red outline flickers, keep tracking from the
+                # target's visible nameplate instead of its stale point.
+                if not has_red:
+                    target["click_x"], target["click_y"] = match["click_x"], match["click_y"]
+                    tx, ty = target["click_x"], target["click_y"]
+            elif (
+                state.confirmed_locked
+                and now - target.get("last_entity_seen_time", state.target_click_time)
+                >= cfg.target_entity_loss_timeout
+                and state.exhausted_caption_check_at is None
+            ):
+                print(
+                    f"[+] Target nameplate missing for {cfg.target_entity_loss_timeout:.1f}s; "
+                    f"releasing stale lock at ({tx}, {ty}) and searching again."
+                )
+                state.current_target = None
+                state.confirmed_locked = False
+                state.consecutive_exhausted = 0
+                state.idle_mark_check_needed = False
+                state.no_target_since = now
+                state.pickup_pending = True
+                state.ignored_stale_marker = (tx, ty)
+                return
+            elif (
+                not state.confirmed_locked
+                and not has_red
+                and now - target.get("last_entity_seen_time", state.target_click_time)
+                >= cfg.target_entity_loss_timeout
+                and state.exhausted_caption_check_at is None
+            ):
+                print(
+                    f"[+] Nearest Skeleton nameplate disappeared for "
+                    f"{cfg.target_entity_loss_timeout:.1f}s before marked.png appeared; "
+                    f"rescanning at ({tx}, {ty})."
+                )
+                state.current_target = None
+                state.confirmed_locked = False
+                state.consecutive_exhausted = 0
+                state.idle_mark_check_needed = False
+                state.no_target_since = now
+                state.ignored_stale_marker = None
+                return
 
         if has_red and position is not None:
             state.idle_mark_check_needed = False
@@ -449,9 +438,6 @@ class RucoyBot:
                 if target["red_observations"] < 2:
                     return
                 state.confirmed_locked = True
-                state.locked_since = now
-                state.fail_counts.pop(target.get("retry_grid"), None)
-                state.retry_context = None
                 state.ignored_exhausted_marker = None
                 print(f"[*] Target locked with red square! Fighting at ({tx}, {ty})...")
             return
@@ -461,7 +447,10 @@ class RucoyBot:
             if loss_since is None:
                 target["red_loss_since"] = now
                 return
-            if now - loss_since < cfg.target_red_loss_timeout:
+            if (
+                now - loss_since < cfg.target_red_loss_timeout
+                or state.exhausted_caption_check_at is not None
+            ):
                 return
             print(
                 f"[+] Red square absent for {cfg.target_red_loss_timeout:.1f}s; "
@@ -469,7 +458,6 @@ class RucoyBot:
             )
             state.current_target = None
             state.confirmed_locked = False
-            state.locked_since = None
             state.consecutive_exhausted = 0
             state.idle_mark_check_needed = False
             state.no_target_since = now
@@ -477,30 +465,10 @@ class RucoyBot:
             state.ignored_stale_marker = (tx, ty)
             return
 
-        # A click that never produces a stable red marker is a failed lock,
-        # not a target worth waiting on.
+        # Keep the nearest visible Skeleton pending until its actual marker is
+        # found. Do not repeatedly click it or blacklist it for a slow marker.
         target["red_observations"] = 0
         target.pop("red_last_seen", None)
-        if now - state.target_click_time > cfg.target_lock_timeout:
-            grid = (int(tx // 40), int(ty // 40))
-            retry_grid = target.get("retry_grid", grid)
-            failures = state.fail_counts.get(retry_grid, 0) + 1
-            state.fail_counts[retry_grid] = failures
-            if failures >= cfg.target_retry_limit:
-                expiry = now + cfg.target_retry_blacklist_seconds
-                state.blacklist[grid] = state.blacklist[retry_grid] = expiry
-                state.fail_counts.pop(retry_grid, None)
-                state.retry_context = None
-                print(f"[-] No target lock after {failures} fresh-position attempts; skipping nearby location for {cfg.target_retry_blacklist_seconds:.0f}s.")
-            else:
-                state.retry_context = {"x": tx, "y": ty, "grid": retry_grid, "time": now}
-                print(f"[-] No target lock after {cfg.target_lock_timeout:.1f}s; checking a fresh mob position before retrying.")
-            state.current_target = None
-            state.confirmed_locked = False
-            state.locked_since = None
-            state.consecutive_exhausted = 0
-            state.idle_mark_check_needed = False
-            state.no_target_since = now
 
     def _find_locked_entity(
         self, frame: np.ndarray, cx: int, cy: int, target: TargetMatch, now: float,
@@ -522,46 +490,6 @@ class RucoyBot:
         )
         distance = np.hypot(nearest["click_x"] - tx, nearest["click_y"] - ty)
         return nearest if distance <= match_radius else None
-
-    def _abandon_stalled_target(self, tx: int, ty: int, now: float) -> None:
-        """Release a lock that has survived too long without defeating its mob."""
-        state, cfg = self.state, self.config
-        expiry = now + cfg.target_stall_blacklist_seconds
-        target = state.current_target or {}
-
-        # The red marker is usually a few pixels below the click point.  Add
-        # the adjacent vertical bucket as well so that the same mob cannot be
-        # rediscovered immediately after a stall.
-        grids: set[Optional[tuple[int, int]]] = set()
-
-        def add_position(position: tuple[int, int] | tuple[float, float]) -> None:
-            grid_x, grid_y = int(position[0] // 40), int(position[1] // 40)
-            grids.update({(grid_x, grid_y), (grid_x, grid_y - 1), (grid_x, grid_y + 1)})
-
-        add_position((tx, ty))
-        retry_grid = target.get("retry_grid")
-        if retry_grid is not None:
-            grids.add(retry_grid)
-        initial_click = target.get("initial_click")
-        if initial_click is not None:
-            add_position(initial_click)
-        for grid in grids:
-            if grid is not None:
-                state.blacklist[grid] = max(state.blacklist.get(grid, 0.0), expiry)
-
-        state.ignored_exhausted_marker = (tx, ty)
-        state.retry_context = None
-        state.current_target = None
-        state.confirmed_locked = False
-        state.locked_since = None
-        state.consecutive_exhausted = 0
-        state.idle_mark_check_needed = False
-        state.no_target_since = now
-        print(
-            f"[!] Target lock stalled for {cfg.target_stall_timeout:.0f}s at "
-            f"({tx}, {ty}); skipping it for "
-            f"{cfg.target_stall_blacklist_seconds:.0f}s and searching again."
-        )
 
     def _preview(self, frame: np.ndarray, cx: int, cy: int) -> None:
         if not self.config.show_preview:

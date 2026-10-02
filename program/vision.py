@@ -366,18 +366,16 @@ class FrameVision:
         if self._marked_template_image is not None:
             return self._marked_template_image
         directory = self.templates.directory if self.templates is not None else TEMPLATE_DIR
-        for filename in ("marked.png", "mob-current-marked.png"):
-            path = directory / filename
-            image = cv2.imread(str(path)) if path.exists() else None
-            if image is not None:
-                difference = np.abs(image.astype(int) - [50, 50, 207])
-                self._marked_template_image = (np.all(difference <= 20, axis=2)).astype(np.uint8) * 255
-                return self._marked_template_image
-        box = np.zeros((72, 72), dtype=np.uint8)
-        box[:7, :] = box[-7:, :] = 255
-        box[:, :7] = box[:, -7:] = 255
-        self._marked_template_image = box
-        return box
+        path = directory / "marked.png"
+        image = cv2.imread(str(path)) if path.exists() else None
+        if image is None:
+            self._marked_template_image = np.zeros((0, 0), dtype=np.uint8)
+        else:
+            difference = np.abs(image.astype(int) - [50, 50, 207])
+            self._marked_template_image = (np.all(difference <= 20, axis=2)).astype(np.uint8) * 255
+            if cv2.countNonZero(self._marked_template_image) == 0:
+                self._marked_template_image = np.zeros((0, 0), dtype=np.uint8)
+        return self._marked_template_image
 
     def _red_marker_mask(self, frame: np.ndarray) -> np.ndarray:
         if self._red_frame is frame and self._red_mask is not None:
@@ -390,12 +388,32 @@ class FrameVision:
         return mask
 
     @staticmethod
-    def _match_outline(mask: np.ndarray, template: np.ndarray, threshold: float = 0.50) -> Optional[tuple[int, int]]:
+    def _match_outline(
+        mask: np.ndarray,
+        template: np.ndarray,
+        threshold: float = 0.50,
+        *,
+        expected_center: Optional[tuple[int, int]] = None,
+        anchor_radius: int = 0,
+    ) -> Optional[tuple[int, int]]:
         th, tw = template.shape[:2]
-        if mask.shape[0] < th or mask.shape[1] < tw:
+        if th == 0 or tw == 0 or mask.shape[0] < th or mask.shape[1] < tw:
             return None
         result = cv2.matchTemplate(mask, template, cv2.TM_CCOEFF_NORMED)
-        _, score, _, location = cv2.minMaxLoc(result)
+        if expected_center is not None:
+            expected_x = expected_center[0] - tw // 2
+            expected_y = expected_center[1] - th // 2
+            x1 = max(0, expected_x - anchor_radius)
+            y1 = max(0, expected_y - anchor_radius)
+            x2 = min(result.shape[1], expected_x + anchor_radius + 1)
+            y2 = min(result.shape[0], expected_y + anchor_radius + 1)
+            search = result[y1:y2, x1:x2]
+            if search.size == 0:
+                return None
+            _, score, _, local_location = cv2.minMaxLoc(search)
+            location = (x1 + local_location[0], y1 + local_location[1])
+        else:
+            _, score, _, location = cv2.minMaxLoc(result)
         if score < threshold:
             return None
         x, y = location
@@ -413,8 +431,16 @@ class FrameVision:
             visible[thickness:-thickness, :thickness], visible[thickness:-thickness, -thickness:],
         )
         hits = [np.count_nonzero(current & expected) / max(1, int(np.count_nonzero(expected))) for expected, current in zip(template_sides, visible_sides)]
-        if border_hit < 0.35 or sum(hit >= 0.22 for hit in hits) < 2:
-            return None
+        if expected_center is not None:
+            # The clicked Skeleton anchors this local search, so accept a
+            # strongly matching partial border when a sprite hides part of it.
+            if border_hit < 0.35 or sum(hit >= 0.20 for hit in hits) < 2:
+                return None
+        else:
+            # Global adoption has no target anchor and needs stronger evidence
+            # from the exact fixed-size outline to reject red scene clutter.
+            if border_hit < 0.55 or sum(hit >= 0.30 for hit in hits) < 3:
+                return None
         return x + tw // 2, y + th // 2
 
     def red_square(
@@ -423,6 +449,8 @@ class FrameVision:
         fh, fw = frame.shape[:2]
         top, bottom, left, right = int(fh * 0.13), int(fh * 0.85), int(fw * 0.08), int(fw * 0.90)
         template = self._marked_template()
+        if template.size == 0:
+            return False, None
         if target is not None:
             tx, ty = target
             x1, x2 = max(left, tx - radius), min(right, tx + radius)
@@ -432,7 +460,13 @@ class FrameVision:
                 # An active target only needs a small crop. Building a red
                 # mask for the whole 1600x900 frame delays the next click.
                 local_mask = cv2.inRange(frame[y1:y2, x1:x2], (28, 28, 185), (72, 72, 229))
-                center = self._match_outline(local_mask, template)
+                center = self._match_outline(
+                    local_mask,
+                    template,
+                    threshold=0.40,
+                    expected_center=(tx - x1, ty - y1),
+                    anchor_radius=max(40, int(radius * 0.55)),
+                )
                 if center is not None:
                     return True, (x1 + center[0], y1 + center[1])
             return False, None

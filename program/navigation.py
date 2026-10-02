@@ -17,6 +17,9 @@ class MinimapRoute:
     signature: tuple[Any, ...]
     waypoints: tuple[tuple[float, float], ...]
     index: int
+    last_player_position: Optional[tuple[float, float]] = None
+    last_target_index: Optional[int] = None
+    last_target_position: Optional[tuple[int, int]] = None
 
 
 @dataclass(frozen=True)
@@ -411,6 +414,7 @@ class MinimapNavigator:
             nearest = int(np.argmin(np.hypot(points[:, 0] - map_x, points[:, 1] - map_y)))
             self.route = MinimapRoute(signature, tuple(waypoints), nearest)
         else:
+            self._check_route_progress((map_x, map_y))
             # Camera movement can carry the player a long way from the old
             # route cursor, especially after a failsafe jump.  Re-anchor it
             # instead of continuing a stale same-row sweep.
@@ -449,6 +453,29 @@ class MinimapNavigator:
         index = int(np.argmax(scores))
         self.last_route_target = (int(round(target_x)), int(round(target_y)))
         return int(round(screen_xs[index])), int(round(screen_ys[index]))
+
+    def _check_route_progress(self, player_position: tuple[float, float]) -> None:
+        route = self.route
+        if route is None or route.last_player_position is None:
+            return
+        moved_cells = float(np.hypot(
+            player_position[0] - route.last_player_position[0],
+            player_position[1] - route.last_player_position[1],
+        ))
+        failed_target_index = route.last_target_index
+        previous_target = route.last_target_position
+        route.last_player_position = None
+        route.last_target_index = None
+        route.last_target_position = None
+        if moved_cells < 0.75:
+            if failed_target_index is not None:
+                route.index = failed_target_index
+            print(
+                f"[!] No minimap progress after tapping waypoint {previous_target}; "
+                f"advancing the route ({moved_cells:.2f} map cells moved)."
+            )
+        else:
+            print(f"[+] Minimap progress confirmed: {moved_cells:.2f} map cells moved.")
 
     def travel(self, *, farthest: bool = False, keep_open_seconds: float = 0.0) -> bool:
         reference_image = self.templates.get(self.minimap_template_key)
@@ -506,9 +533,21 @@ class MinimapNavigator:
         destination = self.destination(frame, alignment, self.safe_mask, player, self.waypoints, farthest=farthest)
         if destination is None:
             return self._fail(icon, "[!] No safe visible minimap waypoint was found; no movement tap sent.")
+        player_map_position = (
+            (player[0] - alignment["origin"][0]) / alignment["scale"],
+            (player[1] - alignment["origin"][1]) / alignment["scale"],
+        )
         mode = "farthest visible" if farthest else "route"
-        print(f"[~] Minimap {mode} waypoint {destination} on {reference_name} from player {player} toward reference {self.last_route_target or '?'} (match {alignment['score']:.2f}, geometry {alignment['geometry']:.2f}, coverage {alignment['coverage']:.2f}, gap {alignment['gap']:.2f}, scale {alignment['scale']:.2f}).")
+        print(f"[~] Minimap {mode} waypoint {destination} on {reference_name} from player {player} at map position ({player_map_position[0]:.1f}, {player_map_position[1]:.1f}) toward reference {self.last_route_target or '?'} (match {alignment['score']:.2f}, geometry {alignment['geometry']:.2f}, coverage {alignment['coverage']:.2f}, gap {alignment['gap']:.2f}, scale {alignment['scale']:.2f}).")
         sent = self.device.click(*destination, synchronous=True)
+        if sent and not farthest and self.route is not None and self.route.waypoints:
+            self.route.last_player_position = player_map_position
+            self.route.last_target_index = (self.route.index + 1) % len(self.route.waypoints)
+            self.route.last_target_position = self.last_route_target
+        elif sent and farthest and self.route is not None:
+            self.route.last_player_position = None
+            self.route.last_target_index = None
+            self.route.last_target_position = None
         if sent:
             # Let the game register the map tap before closing the panel.
             time.sleep(0.30)
@@ -522,6 +561,7 @@ class MinimapNavigator:
                 # sending the Back action.
                 time.sleep(0.8)
         closed = self._close_map(icon)
+        print(f"[~] Minimap movement tap sent={sent}; map closed={closed}.")
         if not closed and keep_open_seconds > 0:
             # A late UI frame can leave the first Back verification stale.
             # Re-match the live icon and make one final delayed close attempt.

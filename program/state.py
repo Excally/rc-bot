@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 import time
 from typing import Optional
 
-from .models import RetryContext, TargetMatch
+from .models import TargetMatch
 
 @dataclass
 class BotState:
@@ -17,9 +17,7 @@ class BotState:
     no_target_since: float = field(default_factory=time.monotonic)
     last_minimap_time: float = 0.0
     frame_count: int = 0
-    fail_counts: dict[tuple[int, int], int] = field(default_factory=dict)
     blacklist: dict[tuple[int, int], float] = field(default_factory=dict)
-    retry_context: Optional[RetryContext] = None
     idle_mark_check_needed: bool = True
     next_idle_mark_check_at: float = 0.0
     ignored_exhausted_marker: Optional[tuple[int, int]] = None
@@ -36,4 +34,3 @@ class BotState:
     exhausted_travel_pending: bool = False
     last_ui_state: str = "other"
     next_ui_check_at: float = 0.0
-    locked_since: Optional[float] = None
