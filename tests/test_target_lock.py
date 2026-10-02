@@ -31,6 +31,16 @@ class _ClickRecorder:
         return True
 
 
+class _LockedEntityVision:
+    def __init__(self, matches):
+        self.matches = matches
+        self.scan_options = None
+
+    def find_targets(self, frame, templates, center_x, center_y, *, search_center, search_radius, include_deadzone):
+        self.scan_options = (center_x, center_y, search_center, search_radius, include_deadzone)
+        return self.matches
+
+
 class TargetLockTests(unittest.TestCase):
     def _locked_bot(self, marker_visible):
         bot = RucoyBot.__new__(RucoyBot)
@@ -55,6 +65,22 @@ class TargetLockTests(unittest.TestCase):
         }
         return bot
 
+    def test_locked_entity_scan_uses_current_target_scanner_api(self):
+        match = {"click_x": 715, "click_y": 450}
+        vision = _LockedEntityVision([match])
+        bot = RucoyBot.__new__(RucoyBot)
+        bot.config = BotConfig()
+        bot.vision = vision
+        bot.target_templates = []
+        target = {"click_x": 700, "click_y": 450}
+
+        found = bot._find_locked_entity(
+            np.zeros((900, 1600, 3), dtype=np.uint8), 800, 450, target, 12.0
+        )
+
+        self.assertIs(found, match)
+        self.assertEqual(vision.scan_options, (800, 450, (700, 450), 150, True))
+
     def test_confirmed_marker_does_not_expire_after_three_minutes(self):
         bot = self._locked_bot(marker_visible=True)
 
@@ -62,7 +88,6 @@ class TargetLockTests(unittest.TestCase):
 
         self.assertTrue(bot.state.confirmed_locked)
         self.assertIsNotNone(bot.state.current_target)
-        self.assertEqual(bot.state.blacklist, {})
 
     def test_missing_marker_releases_lock_after_short_grace_period(self):
         bot = self._locked_bot(marker_visible=False)
@@ -87,7 +112,6 @@ class TargetLockTests(unittest.TestCase):
 
         self.assertIsNotNone(bot.state.current_target)
         self.assertFalse(bot.state.confirmed_locked)
-        self.assertEqual(bot.state.blacklist, {})
 
     def test_pending_nearest_target_keeps_waiting_for_marked_png(self):
         bot = self._locked_bot(marker_visible=False)

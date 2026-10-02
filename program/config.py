@@ -53,8 +53,8 @@ class BotConfig:
     ui_check_interval: float = 0.35
     exhausted_caption_confirm_seconds: float = 10.0
     exhausted_caption_poll_seconds: float = 0.25
-    exhausted_mob_blacklist_seconds: float = 600.0
     exhausted_travel_trigger_count: int = 2
+    exhausted_travel_window_seconds: float = 60.0
     exhausted_travel_hold_seconds: float = 10.0
     repeated_output_limit: int = 20
 

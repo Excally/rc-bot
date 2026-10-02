@@ -90,7 +90,11 @@ class RucoyBot:
         print(f"[+] Movement: Registered minimap waypoints ({'enabled' if self.config.enable_minimap_walk else 'disabled'})")
         print(f"[+] Hitbox Offset: {self.config.mob_body_y_offset}px below nametag (lowered for clean hits)")
         print("[+] Target marker check: waiting for the exact marked.png outline; nearest visible Skeleton first")
-        print(f"[+] Exhaustion failsafe: {self.config.exhausted_travel_trigger_count} consecutive exhausted targets -> farthest minimap point, hold {self.config.exhausted_travel_hold_seconds:.0f}s")
+        print(
+            f"[+] Exhaustion failsafe: {self.config.exhausted_travel_trigger_count} consecutive exhausted targets "
+            f"within {self.config.exhausted_travel_window_seconds:.0f}s -> farthest minimap point, "
+            f"hold {self.config.exhausted_travel_hold_seconds:.0f}s"
+        )
         preview_status = "ON (Press q in preview window to exit)" if self.config.show_preview else "OFF (Press Ctrl+C in terminal to exit)"
         print(f"[+] Preview: {preview_status}")
         print("\n[+] Hunting loop started! You can work while bot is AFK.\n")
@@ -144,9 +148,6 @@ class RucoyBot:
             self._recover_ui(frame, ui_state, now)
             time.sleep(0.08)
             return
-        if state.blacklist and state.frame_count % 30 == 0:
-            state.blacklist = {position: expiry for position, expiry in state.blacklist.items() if now < expiry}
-
         if state.current_target is None:
             self._acquire_target(frame, cx, cy, now)
         if state.pickup_pending:
@@ -222,7 +223,7 @@ class RucoyBot:
         state, cfg = self.state, self.config
         has_red, position = (False, None)
         marker_checked = False
-        if state.idle_mark_check_needed or (state.ignored_exhausted_marker is None and now >= state.next_idle_mark_check_at):
+        if state.idle_mark_check_needed or now >= state.next_idle_mark_check_at:
             has_red, position = self.vision.red_square(frame)
             marker_checked = True
             state.idle_mark_check_needed = False
@@ -235,10 +236,7 @@ class RucoyBot:
                     state.ignored_stale_marker = None
             else:
                 state.ignored_stale_marker = None
-        if has_red and position is not None and state.ignored_exhausted_marker is not None:
-            if np.hypot(position[0] - state.ignored_exhausted_marker[0], position[1] - state.ignored_exhausted_marker[1]) < 140:
-                has_red = False
-        mobs = self.vision.find_targets(frame, self.target_templates, cx, cy, state.blacklist, now)
+        mobs = self.vision.find_targets(frame, self.target_templates, cx, cy)
         if not mobs:
             if now - state.last_log_time > 5.0:
                 print(f"[...] Scanning for '{self.profile.target_name}'... (frame #{state.frame_count}, res {frame.shape[1]}x{frame.shape[0]})")
@@ -248,11 +246,9 @@ class RucoyBot:
         # distance ties, so a farther but sharper nameplate cannot win.
         best = mobs[0]
         bx, by = best["click_x"], best["click_y"]
-        best.setdefault("retry_grid", (int(bx // 40), int(by // 40)))
         if has_red and position is not None:
             marker_gap = np.hypot(position[0] - bx, position[1] - by)
             if marker_gap <= cfg.target_reacquire_radius:
-                state.ignored_exhausted_marker = None
                 state.ignored_stale_marker = None
                 print(f"[*] Detected marked.png on the nearest Skeleton at ({position[0]}, {position[1]}); adopting target...")
                 best["click_x"], best["click_y"] = position
@@ -269,7 +265,6 @@ class RucoyBot:
             return
         print(f"[+] Found {len(mobs)} '{self.profile.target_name}' (selected nearest score:{best['score']:.2f} scale:{best['scale']:.1f}x)")
         print(f"    -> Clicking mob at ({bx}, {by}) [dist:{int(best['distance'])}px]")
-        best["initial_click"], best["last_position_refresh"] = (bx, by), now
         best["last_entity_check"], best["last_entity_seen_time"] = now, now
         state.current_target = best
         state.ignored_stale_marker = None
@@ -301,17 +296,22 @@ class RucoyBot:
             if caption_visible:
                 target = state.current_target
                 tx, ty = target["click_x"], target["click_y"]
-                expiry = now + cfg.exhausted_mob_blacklist_seconds
-                for grid in ((int(tx // 40), int(ty // 40)), target.get("retry_grid"), tuple(int(value // 40) for value in target.get("initial_click", (tx, ty)))):
-                    if grid is not None:
-                        state.blacklist[grid] = max(state.blacklist.get(grid, 0.0), expiry)
-                state.ignored_exhausted_marker = (tx, ty)
+                if (
+                    state.exhausted_window_started_at is None
+                    or now - state.exhausted_window_started_at > cfg.exhausted_travel_window_seconds
+                ):
+                    state.consecutive_exhausted = 0
+                    state.exhausted_window_started_at = now
                 state.consecutive_exhausted += 1
-                print(f"[~] Exhausted caption still visible after {cfg.exhausted_caption_confirm_seconds:.0f}s; skipping mob at ({tx}, {ty}) for {cfg.exhausted_mob_blacklist_seconds:.0f}s.")
+                print(
+                    f"[~] Exhausted caption still visible after {cfg.exhausted_caption_confirm_seconds:.0f}s; "
+                    f"releasing target at ({tx}, {ty}) without position blacklisting."
+                )
                 if state.consecutive_exhausted >= max(1, cfg.exhausted_travel_trigger_count):
                     state.exhausted_travel_pending = True
                     print(
-                        f"[!] {state.consecutive_exhausted} consecutive exhausted targets; "
+                        f"[!] {state.consecutive_exhausted} consecutive exhausted targets within "
+                        f"{cfg.exhausted_travel_window_seconds:.0f}s; "
                         f"starting farthest-waypoint minimap failsafe."
                     )
                 state.current_target = None
@@ -333,7 +333,7 @@ class RucoyBot:
         state.no_target_since = now
         if not cfg.enable_minimap_walk or self.navigator is None:
             print("[!] Exhausted travel failsafe skipped because minimap walking is disabled.")
-            state.consecutive_exhausted = 0
+            self._reset_exhaustion_streak()
             return
         moved = self.navigator.travel(
             farthest=True,
@@ -341,14 +341,17 @@ class RucoyBot:
         )
         state.last_minimap_time = time.monotonic()
         state.no_target_since = state.last_minimap_time
-        state.consecutive_exhausted = 0
+        self._reset_exhaustion_streak()
         if moved:
             # The old screen coordinate belongs to the exhausted mob.  After
             # travelling, allow a fresh scan in the new camera position.
-            state.ignored_exhausted_marker = None
             print("[+] Exhausted travel failsafe complete; resuming normal target scanning.")
         else:
             print("[!] Exhausted travel failsafe could not move; resuming normal scanning.")
+
+    def _reset_exhaustion_streak(self) -> None:
+        self.state.consecutive_exhausted = 0
+        self.state.exhausted_window_started_at = None
 
     def _update_target(self, frame: np.ndarray, cx: int, cy: int, now: float) -> None:
         assert self.device is not None
@@ -365,12 +368,6 @@ class RucoyBot:
         )
         if not has_red and state.confirmed_locked:
             has_red, position = self.vision.red_square(frame)
-
-        if has_red and position is not None and state.ignored_exhausted_marker is not None:
-            old_distance = np.hypot(position[0] - state.ignored_exhausted_marker[0], position[1] - state.ignored_exhausted_marker[1])
-            target_distance = np.hypot(position[0] - tx, position[1] - ty)
-            if old_distance < 140 and target_distance >= old_distance - 25:
-                has_red, position = False, None
 
         if has_red and position is not None:
             target["click_x"], target["click_y"] = position
@@ -400,7 +397,7 @@ class RucoyBot:
                 )
                 state.current_target = None
                 state.confirmed_locked = False
-                state.consecutive_exhausted = 0
+                self._reset_exhaustion_streak()
                 state.idle_mark_check_needed = False
                 state.no_target_since = now
                 state.pickup_pending = True
@@ -420,7 +417,7 @@ class RucoyBot:
                 )
                 state.current_target = None
                 state.confirmed_locked = False
-                state.consecutive_exhausted = 0
+                self._reset_exhaustion_streak()
                 state.idle_mark_check_needed = False
                 state.no_target_since = now
                 state.ignored_stale_marker = None
@@ -438,7 +435,6 @@ class RucoyBot:
                 if target["red_observations"] < 2:
                     return
                 state.confirmed_locked = True
-                state.ignored_exhausted_marker = None
                 print(f"[*] Target locked with red square! Fighting at ({tx}, {ty})...")
             return
 
@@ -458,7 +454,7 @@ class RucoyBot:
             )
             state.current_target = None
             state.confirmed_locked = False
-            state.consecutive_exhausted = 0
+            self._reset_exhaustion_streak()
             state.idle_mark_check_needed = False
             state.no_target_since = now
             state.pickup_pending = True
@@ -466,7 +462,7 @@ class RucoyBot:
             return
 
         # Keep the nearest visible Skeleton pending until its actual marker is
-        # found. Do not repeatedly click it or blacklist it for a slow marker.
+        # found; do not repeatedly click while waiting for a slow marker.
         target["red_observations"] = 0
         target.pop("red_last_seen", None)
 
@@ -479,7 +475,7 @@ class RucoyBot:
         search_radius = max(150, match_radius)
         tx, ty = target["click_x"], target["click_y"]
         matches = self.vision.find_targets(
-            frame, self.target_templates, cx, cy, now=now,
+            frame, self.target_templates, cx, cy,
             search_center=(tx, ty), search_radius=search_radius, include_deadzone=True,
         )
         if not matches:

@@ -201,7 +201,6 @@ class FrameVision:
 
     def find_targets(
         self, frame: np.ndarray, templates: list[tuple[np.ndarray, str]], center_x: int, center_y: int,
-        blacklist: Optional[dict[tuple[int, int], float]] = None, now: float = 0.0,
         *, search_center: Optional[tuple[int, int]] = None, search_radius: Optional[int] = None,
         include_deadzone: bool = True,
     ) -> list[TargetMatch]:
@@ -211,14 +210,14 @@ class FrameVision:
         matches: list[TargetMatch] = []
         for template, color in templates:
             matches.extend(self._find_one_target(
-                frame, template, color, center_x, center_y, blacklist, now,
+                frame, template, color, center_x, center_y,
                 allow_fallback=False, search_center=search_center,
                 search_radius=search_radius, include_deadzone=include_deadzone,
             ))
         if not matches:
             for template, color in templates:
                 matches.extend(self._find_one_target(
-                    frame, template, color, center_x, center_y, blacklist, now,
+                    frame, template, color, center_x, center_y,
                     allow_fallback=True, fallback_only=True,
                     search_center=search_center, search_radius=search_radius,
                     include_deadzone=include_deadzone,
@@ -236,7 +235,6 @@ class FrameVision:
 
     def _find_one_target(
         self, frame: np.ndarray, template: np.ndarray, name_color: str, center_x: int, center_y: int,
-        blacklist: Optional[dict[tuple[int, int], float]], now: float,
         allow_fallback: bool = True, fallback_only: bool = False,
         search_center: Optional[tuple[int, int]] = None, search_radius: Optional[int] = None,
         include_deadzone: bool = True,
@@ -316,9 +314,6 @@ class FrameVision:
                 click_y = y + native_h + int(cfg.mob_body_y_offset * scale)
                 distance = float(np.hypot(click_x - center_x, click_y - center_y))
                 if not include_deadzone and distance < cfg.player_deadzone_radius:
-                    continue
-                grid = (int(click_x // 40), int(click_y // 40))
-                if blacklist and grid in blacklist and now < blacklist[grid]:
                     continue
                 if left <= click_x <= right and top <= click_y <= bottom:
                     matches.append({

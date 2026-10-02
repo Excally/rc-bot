@@ -17,10 +17,8 @@ class BotState:
     no_target_since: float = field(default_factory=time.monotonic)
     last_minimap_time: float = 0.0
     frame_count: int = 0
-    blacklist: dict[tuple[int, int], float] = field(default_factory=dict)
     idle_mark_check_needed: bool = True
     next_idle_mark_check_at: float = 0.0
-    ignored_exhausted_marker: Optional[tuple[int, int]] = None
     ignored_stale_marker: Optional[tuple[int, int]] = None
     last_capture_warning: float = 0.0
     pickup_pending: bool = False
@@ -31,6 +29,7 @@ class BotState:
     exhausted_caption_next_poll: float = 0.0
     exhausted_caption_target: Optional[TargetMatch] = None
     consecutive_exhausted: int = 0
+    exhausted_window_started_at: Optional[float] = None
     exhausted_travel_pending: bool = False
     last_ui_state: str = "other"
     next_ui_check_at: float = 0.0
