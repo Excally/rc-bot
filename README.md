@@ -25,7 +25,7 @@ python bot.py --show-config
 python bot.py --profile skeleton-lv75
 python bot.py --profile zombie-lv65
 ```
-
+## Extra Notes
 The active device connector first tries local BlueStacks ADB and falls back to the MSI App Player window backend with the display resolutin around 1600x900 with 240 DPI and interface seting 100%. with Graphic renderer OpenGL, interface renderer Auto, ASTC texture by software, and prefer dedicated GPU. The older Android Wireless Debugging runner is kept at `deprecated/mobile.py`; it is not connected to the active launcher, so `python bot.py` does not currently connect to a phone over Wi-Fi ADB.
 
 Files in `templates/` are visual references used at runtime. Cell-grid minimap templates must have dimensions divisible by 21, use solid 21×21 pixel blocks without antialiasing, and include a closed white outer wall boundary. White cells mark walls, red cells mark outside space, yellow cells are annotations ignored by registration and player detection, and other colors mark floor. `screenshot-stock/` holds saved screenshots and diagnostic captures, not runtime templates. Older implementations are retained under `deprecated/` for reference.
