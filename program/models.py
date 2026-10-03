@@ -18,6 +18,7 @@ class TargetMatch(TypedDict, total=False):
     red_loss_since: Optional[float]
     red_last_seen: float
     red_observations: int
+    lock_retry_count: int
 
 
 class RetryContext(TypedDict):

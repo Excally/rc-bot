@@ -157,33 +157,6 @@ class MinimapNavigator:
         return waypoints
 
     @staticmethod
-    def _screen_cell_grid(
-        integral: np.ndarray, frame_shape: tuple[int, int], cell_px: float,
-        phase_x: float, phase_y: float,
-    ) -> np.ndarray:
-        """Sample white occupancy once per logical cell using an integral image."""
-        height, width = frame_shape
-        cols = max(0, int(np.floor((width - phase_x) / cell_px)))
-        rows = max(0, int(np.floor((height - phase_y) / cell_px)))
-        if rows == 0 or cols == 0:
-            return np.zeros((rows, cols), dtype=np.uint8)
-        sample = max(3, int(round(cell_px * 0.72)))
-        centers_x = phase_x + (np.arange(cols, dtype=np.float32) + 0.5) * cell_px
-        centers_y = phase_y + (np.arange(rows, dtype=np.float32) + 0.5) * cell_px
-        x1 = np.rint(centers_x - sample / 2).astype(np.int32)
-        y1 = np.rint(centers_y - sample / 2).astype(np.int32)
-        x2, y2 = x1 + sample, y1 + sample
-        x1c, x2c = np.clip(x1, 0, width), np.clip(x2, 0, width)
-        y1c, y2c = np.clip(y1, 0, height), np.clip(y2, 0, height)
-        sums = (
-            integral[y2c[:, None], x2c[None, :]]
-            - integral[y1c[:, None], x2c[None, :]]
-            - integral[y2c[:, None], x1c[None, :]]
-            + integral[y1c[:, None], x1c[None, :]]
-        )
-        return (sums >= sample * sample * 0.30).astype(np.uint8)
-
-    @staticmethod
     def _score_origin(
         integral: np.ndarray, frame_shape: tuple[int, int], cell_map: CellMap,
         cell_px: float, origin: tuple[float, float],
@@ -225,12 +198,12 @@ class MinimapNavigator:
         return geometry, expected_count / total_walls, expected_count
 
     def align(self, frame: np.ndarray, reference: np.ndarray) -> Optional[dict[str, Any]]:
-        """Register both annotated wall layers against bright live minimap walls.
+        """Register the reference by checking every walkable player position.
 
-        Matching runs on a small logical-cell grid, so frame resolution does
-        not multiply template work. Gray unwalkable cells and yellow markers
-        do not vote as wall features. Annotation colors are never expected in
-        the live frame.
+        A detected player marker anchors the live frame to each walkable
+        reference cell in turn. This exhaustive position search avoids relying
+        on a shortlist of local wall-patch winners, which can omit the correct
+        translation in repetitive terrain.
         """
         if self.reference_id == id(reference) and self.cell_map is not None:
             cell_map = self.cell_map
@@ -244,136 +217,136 @@ class MinimapNavigator:
             self.safe_mask = cell_map.safe_mask
             self.waypoints = self.build_waypoints(cell_map.safe_mask)
             self.reference_id = id(reference)
+        player = self.player_marker(frame)
+        if player is None:
+            return {
+                "valid": False,
+                "score": 0.0,
+                "geometry": 0.0,
+                "coverage": 0.0,
+                "gap": 0.0,
+                "player_walkable": False,
+                "positions_tested": 0,
+                "failed_checks": ("player marker not detected",),
+            }
         white_mask = cv2.inRange(frame, (220, 220, 220), (255, 255, 255))
         if cv2.countNonZero(white_mask) < 120:
             return None
         integral = cv2.integral(white_mask // 255, sdepth=cv2.CV_32S)
         frame_h, frame_w = frame.shape[:2]
-        match_walls = cell_map.match_walls
-        map_h, map_w = match_walls.shape
-        patch_h = min(28, map_h - 2)
-        patch_w = min(32, map_w - 2)
-        if patch_h < 12 or patch_w < 12:
+        cell_px = float(MAP_CELL_PIXELS)
+        walkable_y, walkable_x = np.where(cell_map.walkable > 0)
+        positions_tested = len(walkable_x)
+        coarse: list[dict[str, Any]] = []
+        # Test every possible walkable tile as the player's map position.
+        for map_x, map_y in zip(walkable_x, walkable_y):
+            origin = (
+                player[0] - (float(map_x) + 0.5) * cell_px,
+                player[1] - (float(map_y) + 0.5) * cell_px,
+            )
+            geometry, coverage, visible_cells = self._score_origin(
+                integral, (frame_h, frame_w), cell_map, cell_px, origin
+            )
+            coarse.append({
+                "geometry": geometry,
+                "coverage": coverage,
+                "visible_cells": visible_cells,
+                "origin": origin,
+                "scale": cell_px,
+                "player_walkable": True,
+            })
+        if not coarse:
             return None
+        coarse.sort(key=lambda item: item["geometry"], reverse=True)
 
-        # Distributed patches cast translation votes. Several separated
-        # patches must agree, which rejects repeated nameplates and HUD tiles.
-        patch_positions = sorted({
-            (x, y)
-            for y in (0, max(0, (map_h - patch_h) // 2), map_h - patch_h)
-            for x in (0, max(0, (map_w - patch_w) // 2), map_w - patch_w)
-        })
-        patches: list[tuple[int, int, np.ndarray]] = []
-        for x, y in patch_positions:
-            patch = match_walls[y:y + patch_h, x:x + patch_w].astype(np.float32)
-            wall_count = int(np.count_nonzero(patch))
-            if wall_count >= 10 and wall_count <= patch.size * 0.55:
-                patches.append((x, y, patch))
-        if not patches:
-            return None
-
-        # The game and the authored skeleton map both use exactly 21 pixels
-        # per cell; keeping that fixed avoids unnecessary scale searches.
-        scales = (float(MAP_CELL_PIXELS),)
-        votes: dict[tuple[int, int, int], list[float]] = {}
-        candidate_origins: dict[tuple[int, int, int], tuple[float, float, float]] = {}
-        for scale_index, cell_px in enumerate(scales):
-            phase_values = (cell_px * 0.20, cell_px * 0.70)
-            for phase_y in phase_values:
-                for phase_x in phase_values:
-                    grid = self._screen_cell_grid(
-                        integral, (frame_h, frame_w), cell_px, phase_x, phase_y
-                    )
-                    if grid.shape[0] < patch_h or grid.shape[1] < patch_w:
-                        continue
-                    for ref_x, ref_y, patch in patches:
-                        response = cv2.matchTemplate(
-                            grid.astype(np.float32), patch, cv2.TM_CCOEFF_NORMED
-                        )
-                        for _ in range(1):
-                            _, score, _, location = cv2.minMaxLoc(response)
-                            if not np.isfinite(score):
-                                break
-                            origin_x = phase_x + (location[0] - ref_x) * cell_px
-                            origin_y = phase_y + (location[1] - ref_y) * cell_px
-                            bin_size = max(5.0, cell_px / 3.0)
-                            key = (
-                                scale_index,
-                                int(round(origin_x / bin_size)),
-                                int(round(origin_y / bin_size)),
-                            )
-                            votes.setdefault(key, []).append(float(score))
-                            candidate_origins[key] = (origin_x, origin_y, cell_px)
-                            lx, ly = location
-                            x1, x2 = max(0, lx - 3), min(response.shape[1], lx + 4)
-                            y1, y2 = max(0, ly - 3), min(response.shape[0], ly + 4)
-                            response[y1:y2, x1:x2] = -1.0
-
-        if not votes:
-            return None
-        ranked = sorted(
-            votes,
-            key=lambda key: (len(votes[key]), float(np.mean(votes[key]))),
-            reverse=True,
-        )[:8]
+        # Refine the strongest exhaustive candidates around the tile-center
+        # estimate. The marker can sit a few pixels off the logical cell
+        # center, but remains in that same tile.
         candidates: list[dict[str, Any]] = []
-        for key in ranked:
-            approx_x, approx_y, cell_px = candidate_origins[key]
-            # Refine translation around the grid vote at two-pixel steps.
+        for seed in coarse[:32]:
             best_local: Optional[dict[str, Any]] = None
-            for offset_y in (-3, 0, 3):
-                for offset_x in (-3, 0, 3):
-                    origin = (approx_x + offset_x, approx_y + offset_y)
+            for offset_y in (-9, -6, -3, 0, 3, 6, 9):
+                for offset_x in (-9, -6, -3, 0, 3, 6, 9):
+                    origin = (
+                        seed["origin"][0] + offset_x,
+                        seed["origin"][1] + offset_y,
+                    )
                     geometry, coverage, visible_cells = self._score_origin(
                         integral, (frame_h, frame_w), cell_map, cell_px, origin
                     )
+                    player_map_x = (player[0] - origin[0]) / cell_px
+                    player_map_y = (player[1] - origin[1]) / cell_px
+                    map_x, map_y = int(np.floor(player_map_x)), int(np.floor(player_map_y))
+                    player_walkable = bool(
+                        0 <= map_x < cell_map.walkable.shape[1]
+                        and 0 <= map_y < cell_map.walkable.shape[0]
+                        and cell_map.walkable[map_y, map_x] > 0
+                    )
+                    if not player_walkable:
+                        continue
                     candidate = {
                         "geometry": geometry,
                         "coverage": coverage,
                         "visible_cells": visible_cells,
                         "origin": origin,
                         "scale": cell_px,
-                        "patch_score": float(np.mean(votes[key])),
+                        "player_walkable": True,
                     }
                     if best_local is None or geometry > best_local["geometry"]:
                         best_local = candidate
-            if best_local is not None:
-                # Multiple patch votes at essentially the same placement are
-                # one alignment, not competing matches for the confidence gap.
-                if any(
-                    abs(best_local["origin"][0] - item["origin"][0]) < cell_px * 0.45
-                    and abs(best_local["origin"][1] - item["origin"][1]) < cell_px * 0.45
-                    and abs(cell_px - item["scale"]) < 1.0
-                    for item in candidates
-                ):
-                    continue
+            if best_local is None:
+                continue
+            # Adjacent tile-center seeds may refine to the same translation;
+            # count that local match only once in the ambiguity gap.
+            duplicate_index = next((
+                index for index, item in enumerate(candidates)
+                if abs(best_local["origin"][0] - item["origin"][0]) < cell_px * 0.65
+                and abs(best_local["origin"][1] - item["origin"][1]) < cell_px * 0.65
+            ), None)
+            if duplicate_index is None:
                 candidates.append(best_local)
+            elif best_local["geometry"] > candidates[duplicate_index]["geometry"]:
+                candidates[duplicate_index] = best_local
         if not candidates:
             return None
-        candidates.sort(key=lambda item: (item["geometry"], item["patch_score"]), reverse=True)
+        candidates.sort(key=lambda item: item["geometry"], reverse=True)
         best = candidates[0]
         second_geometry = candidates[1]["geometry"] if len(candidates) > 1 else 0.0
         gap = best["geometry"] - second_geometry
         minimum_cells = max(20, int(np.ceil(
             self.config.minimap_min_visible_reference_pixels / (MAP_CELL_PIXELS ** 2)
         )))
-        valid = (
-            best["geometry"] >= self.config.minimap_geometry_min_score
-            and gap >= self.config.minimap_align_min_gap
-            and best["visible_cells"] >= minimum_cells
-            and best["coverage"] >= self.config.minimap_min_visible_reference_fraction
-        )
+        failed_checks: list[str] = []
+        if best["geometry"] < self.config.minimap_geometry_min_score:
+            failed_checks.append(
+                f"map {best['geometry']:.3f} < {self.config.minimap_geometry_min_score:.3f}"
+            )
+        if gap < self.config.minimap_align_min_gap:
+            failed_checks.append(f"gap {gap:.3f} < {self.config.minimap_align_min_gap:.3f}")
+        if best["visible_cells"] < minimum_cells:
+            failed_checks.append(
+                f"visible cells {best['visible_cells']} < {minimum_cells}"
+            )
+        if best["coverage"] < self.config.minimap_min_visible_reference_fraction:
+            failed_checks.append(
+                f"coverage {best['coverage']:.3f} < "
+                f"{self.config.minimap_min_visible_reference_fraction:.3f}"
+            )
+        if not best["player_walkable"]:
+            failed_checks.append("player is not on reference walkable terrain")
+        valid = not failed_checks
         return {
             "valid": valid,
             # The public score is the full visible-map geometric F-score.
-            # Patch correlation is only a coarse candidate-voting signal and
-            # should not be reported as the map's final match accuracy.
             "score": best["geometry"],
-            "patch_score": best["patch_score"],
             "geometry": best["geometry"],
             "gap": gap,
             "coverage": best["coverage"],
             "visible_pixels": best["visible_cells"] * MAP_CELL_PIXELS ** 2,
+            "player_walkable": best["player_walkable"],
+            "positions_tested": positions_tested,
+            "positions_refined": min(32, len(coarse)),
+            "failed_checks": tuple(failed_checks),
             "scale": best["scale"],
             "origin": tuple(int(round(value)) for value in best["origin"]),
         }
@@ -388,7 +361,7 @@ class MinimapNavigator:
         choices: list[tuple[float, tuple[int, int]]] = []
         for index in range(1, count):
             x, y, w, h, area = stats[index]
-            if not (200 <= area <= 3000 and 14 <= w <= 100 and 14 <= h <= 100):
+            if not (25 <= area <= 3000 and 5 <= w <= 100 and 5 <= h <= 100):
                 continue
             point = centroids[index]
             distance = float(np.linalg.norm(point - center))
@@ -557,7 +530,8 @@ class MinimapNavigator:
         if not alignment or not alignment.get("valid"):
             details = alignment or {}
             self._save_alignment_comparison(frame, reference_image, alignment)
-            return self._fail(icon, f"[!] Minimap alignment rejected (map score {details.get('score', 0.0):.2f}, patch vote {details.get('patch_score', 0.0):.2f}, coverage {details.get('coverage', 0.0):.2f}, gap {details.get('gap', 0.0):.2f}); no movement tap sent.")
+            failed = ", ".join(details.get("failed_checks", ())) or "no candidate details"
+            return self._fail(icon, f"[!] Minimap alignment rejected (map {details.get('score', 0.0):.3f}, coverage {details.get('coverage', 0.0):.3f}, gap {details.get('gap', 0.0):.3f}, player walkable {details.get('player_walkable', 'unknown')}, positions {details.get('positions_tested', 0)}; failed: {failed}); no movement tap sent.")
         reference = self.templates.get(reference_name) if reference_name is not None else None
         if reference is None:
             return self._fail(icon, "[!] Minimap reference disappeared during registration; no movement tap sent.")
@@ -580,8 +554,7 @@ class MinimapNavigator:
             (player[1] - alignment["origin"][1]) / alignment["scale"],
         )
         mode = "farthest visible" if farthest else "route"
-        patch_score = alignment.get("patch_score", alignment["score"])
-        print(f"[~] Minimap {mode} waypoint {destination} on {reference_name} from player {player} at map position ({player_map_position[0]:.1f}, {player_map_position[1]:.1f}) toward reference {self.last_route_target or '?'} (map score {alignment['score']:.2f}, patch vote {patch_score:.2f}, coverage {alignment['coverage']:.2f}, gap {alignment['gap']:.2f}, scale {alignment['scale']:.2f}).")
+        print(f"[~] Minimap {mode} waypoint {destination} on {reference_name} from player {player} at map position ({player_map_position[0]:.1f}, {player_map_position[1]:.1f}) toward reference {self.last_route_target or '?'} (map score {alignment['score']:.2f}, coverage {alignment['coverage']:.2f}, gap {alignment['gap']:.2f}, positions {alignment.get('positions_tested', 0)}, scale {alignment['scale']:.2f}).")
         sent = self.device.click(*destination, synchronous=True)
         if sent and not farthest and self.route is not None and self.route.waypoints:
             self.route.last_player_position = player_map_position
@@ -686,9 +659,11 @@ class MinimapNavigator:
             canvas = np.full((header_h + panel_h + 28, panel_w * 2 + live_w + gap * 2, 3), 20, dtype=np.uint8)
             details = alignment or {}
             summary = (
-                f"valid={details.get('valid', False)}  map={details.get('score', 0.0):.2f}  "
-                f"patch={details.get('patch_score', 0.0):.2f}  coverage={details.get('coverage', 0.0):.2f}  "
-                f"gap={details.get('gap', 0.0):.2f}  origin={details.get('origin', '?')}  scale={details.get('scale', '?')}"
+                f"valid={details.get('valid', False)}  map={details.get('score', 0.0):.3f}  "
+                f"coverage={details.get('coverage', 0.0):.3f}  "
+                f"gap={details.get('gap', 0.0):.3f}  player_walkable={details.get('player_walkable', '?')}  "
+                f"positions={details.get('positions_tested', 0)}  origin={details.get('origin', '?')}  "
+                f"scale={details.get('scale', '?')}"
             )
             cv2.putText(canvas, "Minimap alignment comparison (saved from this exact frame)", (16, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (245, 245, 245), 2, cv2.LINE_AA)
             cv2.putText(canvas, summary, (16, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (210, 210, 210), 1, cv2.LINE_AA)

@@ -20,6 +20,8 @@ class BotState:
     idle_mark_check_needed: bool = True
     next_idle_mark_check_at: float = 0.0
     ignored_stale_marker: Optional[tuple[int, int]] = None
+    unconfirmed_target_position: Optional[tuple[int, int]] = None
+    unconfirmed_target_until: float = 0.0
     last_capture_warning: float = 0.0
     pickup_pending: bool = False
     ui_recovery_interval: float = 1.5

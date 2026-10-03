@@ -19,11 +19,11 @@ class BotConfig:
     minimap_align_min_gap: float = 0.025
     # Partial views can score below 0.40; coverage and candidate separation
     # provide additional safeguards for this lower geometry threshold.
-    minimap_geometry_min_score: float = 0.30
+    minimap_geometry_min_score: float = 0.25
     # The map overlay is drawn over a changing game scene, so raw grayscale
     # template scores are not reliable.  Require a meaningful amount of the
     # reference linework to be visible before accepting geometry-only matches.
-    minimap_min_visible_reference_fraction: float = 0.30
+    minimap_min_visible_reference_fraction: float = 0.20
     minimap_min_visible_reference_pixels: int = 30000
 
     margin_top: float = 0.12
@@ -53,10 +53,10 @@ class BotConfig:
     ui_check_interval: float = 0.35
     exhausted_caption_confirm_seconds: float = 10.0
     exhausted_caption_poll_seconds: float = 0.25
-    exhausted_travel_trigger_count: int = 2
-    exhausted_travel_window_seconds: float = 60.0
+    exhausted_travel_trigger_count: int = 1
+    exhausted_travel_window_seconds: float = 30.0
     exhausted_travel_hold_seconds: float = 10.0
-    repeated_output_limit: int = 20
+    repeated_output_limit: int = 200
 
 
 CONFIG = BotConfig()

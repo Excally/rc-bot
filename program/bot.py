@@ -82,6 +82,12 @@ class RucoyBot:
         print(f"[+] Method: {'ADB Background Tap (Free Mouse)' if self.device.use_adb else 'Win32 Click'}")
         print(f"[+] Background: {'YES (Can stay behind other windows)' if self.device.use_adb else 'Window visible'}")
         print(f"[+] Movement: Registered minimap waypoints ({'enabled' if self.config.enable_minimap_walk else 'disabled'})")
+        print(
+            f"[+] Minimap alignment limits: map>={self.config.minimap_geometry_min_score:.2f}, "
+            f"coverage>={self.config.minimap_min_visible_reference_fraction:.2f}, "
+            f"gap>={self.config.minimap_align_min_gap:.3f}, "
+            f"visible pixels>={self.config.minimap_min_visible_reference_pixels}"
+        )
         print(f"[+] Hitbox Offset: {self.config.mob_body_y_offset}px below nametag (lowered for clean hits)")
         print("[+] Target marker check: waiting for the exact marked.png outline; nearest visible Skeleton first")
         print(
@@ -142,14 +148,16 @@ class RucoyBot:
             self._recover_ui(frame, ui_state, now)
             time.sleep(0.08)
             return
-        if state.current_target is None:
-            self._acquire_target(frame, cx, cy, now)
-        if state.pickup_pending:
+        # Finish a pending loot tap before selecting the next mob. Sending it
+        # after target acquisition can immediately steal the game's focus.
+        if state.current_target is None and state.pickup_pending:
             pickup = self.vision.pickup_position(frame)
             if pickup is not None:
                 print(f"[+] Pickup available after kill; tapping ({pickup[0]}, {pickup[1]}).")
                 if self.device.click(*pickup):
                     state.pickup_pending = False
+        if state.current_target is None:
+            self._acquire_target(frame, cx, cy, now)
         self._check_exhausted_caption(frame, now)
         if state.exhausted_travel_pending:
             self._run_exhausted_travel_failsafe(now)
@@ -231,6 +239,18 @@ class RucoyBot:
             else:
                 state.ignored_stale_marker = None
         mobs = self.vision.find_targets(frame, self.target_templates, cx, cy)
+        if state.unconfirmed_target_position is not None:
+            if now >= state.unconfirmed_target_until:
+                state.unconfirmed_target_position = None
+            else:
+                ignored_x, ignored_y = state.unconfirmed_target_position
+                mobs = [
+                    mob for mob in mobs
+                    if not (
+                        abs(mob.get("nx", mob["click_x"]) - ignored_x) < 30
+                        and abs(mob.get("ny", mob["click_y"]) - ignored_y) < 15
+                    )
+                ]
         if not mobs:
             if now - state.last_log_time > 5.0:
                 print(f"[...] Scanning for '{self.profile.target_name}'... (frame #{state.frame_count}, res {frame.shape[1]}x{frame.shape[0]})")
@@ -260,6 +280,7 @@ class RucoyBot:
         print(f"[+] Found {len(mobs)} '{self.profile.target_name}' (selected nearest score:{best['score']:.2f} scale:{best['scale']:.1f}x)")
         print(f"    -> Clicking mob at ({bx}, {by}) [dist:{int(best['distance'])}px]")
         best["last_entity_check"], best["last_entity_seen_time"] = now, now
+        best["lock_retry_count"] = 0
         state.current_target = best
         state.ignored_stale_marker = None
         state.target_click_time = now
@@ -390,6 +411,8 @@ class RucoyBot:
                 # target's visible nameplate instead of its stale point.
                 if not has_red:
                     target["click_x"], target["click_y"] = match["click_x"], match["click_y"]
+                    target["nx"] = match.get("nx", target.get("nx", tx))
+                    target["ny"] = match.get("ny", target.get("ny", ty))
                     tx, ty = target["click_x"], target["click_y"]
             elif (
                 state.confirmed_locked
@@ -468,9 +491,42 @@ class RucoyBot:
             return
 
         # Keep the nearest visible Skeleton pending until its actual marker is
-        # found; do not repeatedly click while waiting for a slow marker.
+        # found. Retry one missed tap, then skip that nameplate briefly so the
+        # bot can move on instead of waiting forever on an unmarked target.
         target["red_observations"] = 0
         target.pop("red_last_seen", None)
+        if (
+            not state.confirmed_locked
+            and not has_red
+            and state.exhausted_caption_check_at is None
+            and now - state.target_click_time >= cfg.target_entity_loss_timeout
+        ):
+            retries = int(target.get("lock_retry_count", 0))
+            if retries < 1:
+                target["lock_retry_count"] = retries + 1
+                state.target_click_time = now
+                if self.device.click(tx, ty):
+                    print(
+                        f"[~] No red mark after {cfg.target_entity_loss_timeout:.1f}s; "
+                        f"retrying the target click at ({tx}, {ty})."
+                    )
+                else:
+                    print(f"[!] Target retry click failed at ({tx}, {ty}); will keep checking for its red mark.")
+                return
+            ignored_position = (
+                int(target.get("nx", tx)), int(target.get("ny", ty))
+            )
+            state.unconfirmed_target_position = ignored_position
+            state.unconfirmed_target_until = now + cfg.target_entity_loss_timeout
+            print(
+                f"[!] No red mark after retry; skipping the unconfirmed target "
+                f"at {ignored_position} briefly and searching for another mob."
+            )
+            state.current_target = None
+            state.confirmed_locked = False
+            state.idle_mark_check_needed = True
+            state.no_target_since = now
+            self._reset_exhaustion_streak()
 
     def _find_locked_entity(
         self, frame: np.ndarray, cx: int, cy: int, target: TargetMatch, now: float,

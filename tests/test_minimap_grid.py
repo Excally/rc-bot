@@ -51,7 +51,7 @@ class MinimapGridTests(unittest.TestCase):
     def test_registration_recovers_shifted_cell_map_with_occlusion(self):
         cell_map = self.navigator._build_cell_map(self.reference)
         frame = np.zeros((900, 1600, 3), dtype=np.uint8)
-        origin_x, origin_y = -315, -210
+        origin_x, origin_y = -218, -548
         ys, xs = np.where(cell_map.match_walls)
         for cell_y, cell_x in zip(ys, xs):
             x1 = origin_x + int(cell_x) * MAP_CELL_PIXELS
@@ -63,15 +63,23 @@ class MinimapGridTests(unittest.TestCase):
                 frame[cy1:cy2, cx1:cx2] = (243, 243, 243)
         # A moving sprite covers a small piece of the static wall drawing.
         frame[360:430, 740:805] = (38, 53, 17)
+        # The saved comparison shrinks the live frame by half: its 7x7 cyan
+        # marker is only about 35 pixels in the actual captured frame.
+        cv2.circle(frame, (801, 450), 3, (255, 255, 0), -1)
         result = self.navigator.align(frame, self.reference)
         self.assertIsNotNone(result)
         self.assertTrue(result["valid"], result)
         self.assertGreater(result["geometry"], 0.70, result)
         self.assertEqual(result["score"], result["geometry"])
-        self.assertIn("patch_score", result)
+        self.assertEqual(result["positions_tested"], 2837, result)
         self.assertLessEqual(abs(result["origin"][0] - origin_x), 7, result)
         self.assertLessEqual(abs(result["origin"][1] - origin_y), 7, result)
         self.assertGreaterEqual(result["coverage"], 0.35, result)
+
+    def test_small_cyan_player_marker_is_detected_near_screen_center(self):
+        frame = np.zeros((900, 1600, 3), dtype=np.uint8)
+        cv2.circle(frame, (801, 450), 3, (255, 255, 0), -1)
+        self.assertEqual(self.navigator.player_marker(frame), (801, 450))
 
     def test_unrelated_bright_scene_does_not_lock_a_map_position(self):
         rng = np.random.default_rng(7)
@@ -81,7 +89,9 @@ class MinimapGridTests(unittest.TestCase):
         cv2.putText(frame, "475/475", (100, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
                     (245, 245, 245), 2, cv2.LINE_8)
         result = self.navigator.align(frame, self.reference)
-        self.assertTrue(result is None or not result["valid"], result)
+        self.assertIsNotNone(result)
+        self.assertFalse(result["valid"], result)
+        self.assertIn("player marker not detected", result["failed_checks"])
 
     def test_red_outside_color_is_not_a_player_marker(self):
         frame = np.zeros((900, 1600, 3), dtype=np.uint8)
