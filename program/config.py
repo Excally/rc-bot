@@ -23,7 +23,7 @@ class BotConfig:
     # The map overlay is drawn over a changing game scene, so raw grayscale
     # template scores are not reliable.  Require a meaningful amount of the
     # reference linework to be visible before accepting geometry-only matches.
-    minimap_min_visible_reference_fraction: float = 0.35
+    minimap_min_visible_reference_fraction: float = 0.30
     minimap_min_visible_reference_pixels: int = 30000
 
     margin_top: float = 0.12
@@ -49,7 +49,7 @@ class BotConfig:
     target_entity_loss_timeout: float = 2.0
     # Release quickly when the exact marker disappears; a surviving nameplate
     # alone is not enough to keep a target locked.
-    target_red_loss_timeout: float = 1.5
+    target_red_loss_timeout: float = 1.0
     ui_check_interval: float = 0.35
     exhausted_caption_confirm_seconds: float = 10.0
     exhausted_caption_poll_seconds: float = 0.25

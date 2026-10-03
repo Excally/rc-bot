@@ -40,8 +40,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"Profile: {profile.key}")
         print(f"Target: {profile.target_name}")
         print(f"Name template: {profile.target_template_key}.png")
-        if profile.target_purple_template_key:
-            print(f"Purple name template: {profile.target_purple_template_key}.png")
         print(f"Minimap template: {profile.minimap_template_key}.png")
         return 0
 

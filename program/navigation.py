@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 import time
 from typing import Any, Optional
 
@@ -27,10 +28,17 @@ class CellMap:
     """A color-coded map reduced to exact, uniform logical cells."""
 
     walls: np.ndarray
-    outside: np.ndarray
+    context_walls: np.ndarray
+    unwalkable: np.ndarray
     annotations: np.ndarray
+    walkable: np.ndarray
     safe_mask: np.ndarray
     cell_pixels: int = 21
+
+    @property
+    def match_walls(self) -> np.ndarray:
+        """Both wall layers help registration; only the black path is navigable."""
+        return self.walls | self.context_walls
 
 
 MAP_CELL_PIXELS = 21
@@ -56,12 +64,17 @@ class MinimapNavigator:
         self.last_route_target: Optional[tuple[int, int]] = None
 
     @staticmethod
-    def _cell_labels(reference: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Read the skeleton's un-antialiased 21px cell palette.
+    def _cell_labels(
+        reference: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Read the skeleton's exact 21px annotation palette.
 
-        White is a wall, red is outside, and yellow is a hand-marked cell.
-        Yellow is retained as annotation metadata but never drives alignment
-        or player detection. Every remaining cell is floor.
+        The reference uses black for the walkable path, gray for unwalkable
+        terrain, white for this map's walls, and red for context walls from a
+        neighboring map. Both wall layers aid image registration, while only
+        black cells may be destinations. Yellow markers remain blocked.
+        These annotation colors describe the reference; the live minimap is
+        still recognized from its grayscale appearance.
         """
         if reference is None or reference.ndim != 3 or reference.shape[2] < 3:
             raise ValueError("The minimap template must be a BGR color image.")
@@ -85,33 +98,33 @@ class MinimapNavigator:
                 "each map cell must be a solid 21x21 color block."
             )
 
-        blue, green, red = [cell_colors[:, :, channel].astype(np.int16) for channel in range(3)]
-        spread = np.maximum(np.maximum(blue, green), red) - np.minimum(np.minimum(blue, green), red)
-        walls = (np.minimum(np.minimum(blue, green), red) >= 220) & (spread <= 35)
-        outside = (red >= 170) & (red > green * 1.35) & (red > blue * 1.35)
-        annotations = (green >= 170) & (red >= 150) & (blue <= 100)
-        return walls, outside, annotations
+        # OpenCV stores colors in BGR order. Keep this palette exact so a new
+        # annotation color cannot silently become a routeable floor cell.
+        walls = np.all(cell_colors == (243, 243, 243), axis=2)
+        context_walls = np.all(cell_colors == (0, 0, 255), axis=2)
+        unwalkable = np.all(cell_colors == (132, 132, 132), axis=2)
+        walkable = np.all(cell_colors == (0, 0, 0), axis=2)
+        annotations = np.all(cell_colors == (0, 255, 234), axis=2)
+        recognized = walls | context_walls | unwalkable | walkable | annotations
+        if not np.all(recognized):
+            raise ValueError("The minimap template contains cells outside its documented color palette.")
+        return walls, context_walls, unwalkable, annotations, walkable
 
     @classmethod
     def _build_cell_map(cls, reference: np.ndarray) -> CellMap:
-        walls, outside, annotations = cls._cell_labels(reference)
-        wall_u8 = walls.astype(np.uint8) * 255
-        contours, _ = cv2.findContours(wall_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        height, width = walls.shape
-        safe = np.zeros((height, width), dtype=np.uint8)
-        if contours:
-            outer = max(contours, key=cv2.contourArea)
-            if cv2.contourArea(outer) >= height * width * 0.15:
-                cv2.drawContours(safe, [outer], -1, 255, thickness=cv2.FILLED)
-        if cv2.countNonZero(safe) == 0:
-            raise ValueError("The minimap template needs a clear enclosing white wall boundary.")
-        # Cell-sized clearance keeps taps away from wall tiles. Annotation
-        # cells inherit the surrounding floor; red outside cells stay blocked.
-        blocked = cv2.dilate(wall_u8, np.ones((3, 3), np.uint8), iterations=1)
-        safe[(blocked > 0) | outside] = 0
+        walls, context_walls, unwalkable, annotations, walkable = cls._cell_labels(reference)
+        if not np.any(walkable):
+            raise ValueError("The minimap template contains no explicitly walkable black cells.")
+        walkable_u8 = walkable.astype(np.uint8) * 255
+        # Only black cells are routeable. Keep clicks a cell away from every
+        # nonwalkable class, including gray terrain and both wall layers.
+        blocked = (~walkable).astype(np.uint8) * 255
+        clearance = cv2.dilate(blocked, np.ones((3, 3), np.uint8), iterations=1)
+        safe = walkable_u8.copy()
+        safe[clearance > 0] = 0
         if cv2.countNonZero(safe) == 0:
             raise ValueError("The minimap template contains no safe floor cells.")
-        return CellMap(walls, outside, annotations, safe)
+        return CellMap(walls, context_walls, unwalkable, annotations, walkable_u8, safe)
 
     @staticmethod
     def build_waypoints(safe_mask: np.ndarray, grid_step: int = 6) -> list[tuple[float, float]]:
@@ -197,13 +210,14 @@ class MinimapNavigator:
             + integral[y1c[:, None], x1c[None, :]]
         )
         observed = sums >= sample * sample * 0.30
-        expected = cell_map.walls & visible
+        match_walls = cell_map.match_walls
+        expected = match_walls & visible
         expected_count = int(np.count_nonzero(expected))
-        total_walls = max(1, int(np.count_nonzero(cell_map.walls)))
+        total_walls = max(1, int(np.count_nonzero(match_walls)))
         if expected_count == 0:
             return 0.0, 0.0, 0
         hits = int(np.count_nonzero(expected & observed))
-        precision_area = visible & ~cell_map.outside & ~cell_map.annotations
+        precision_area = visible & ~cell_map.annotations
         observed_count = int(np.count_nonzero(observed & precision_area))
         recall = hits / expected_count
         precision = hits / max(1, observed_count)
@@ -211,11 +225,12 @@ class MinimapNavigator:
         return geometry, expected_count / total_walls, expected_count
 
     def align(self, frame: np.ndarray, reference: np.ndarray) -> Optional[dict[str, Any]]:
-        """Register the 21px cell map against white wall cells in the live view.
+        """Register both annotated wall layers against bright live minimap walls.
 
         Matching runs on a small logical-cell grid, so frame resolution does
-        not multiply template work. Red outside cells and yellow annotations
-        never participate in registration.
+        not multiply template work. Gray unwalkable cells and yellow markers
+        do not vote as wall features. Annotation colors are never expected in
+        the live frame.
         """
         if self.reference_id == id(reference) and self.cell_map is not None:
             cell_map = self.cell_map
@@ -234,7 +249,8 @@ class MinimapNavigator:
             return None
         integral = cv2.integral(white_mask // 255, sdepth=cv2.CV_32S)
         frame_h, frame_w = frame.shape[:2]
-        map_h, map_w = cell_map.walls.shape
+        match_walls = cell_map.match_walls
+        map_h, map_w = match_walls.shape
         patch_h = min(28, map_h - 2)
         patch_w = min(32, map_w - 2)
         if patch_h < 12 or patch_w < 12:
@@ -249,7 +265,7 @@ class MinimapNavigator:
         })
         patches: list[tuple[int, int, np.ndarray]] = []
         for x, y in patch_positions:
-            patch = cell_map.walls[y:y + patch_h, x:x + patch_w].astype(np.float32)
+            patch = match_walls[y:y + patch_h, x:x + patch_w].astype(np.float32)
             wall_count = int(np.count_nonzero(patch))
             if wall_count >= 10 and wall_count <= patch.size * 0.55:
                 patches.append((x, y, patch))
@@ -317,7 +333,7 @@ class MinimapNavigator:
                         "visible_cells": visible_cells,
                         "origin": origin,
                         "scale": cell_px,
-                        "score": float(np.mean(votes[key])),
+                        "patch_score": float(np.mean(votes[key])),
                     }
                     if best_local is None or geometry > best_local["geometry"]:
                         best_local = candidate
@@ -334,7 +350,7 @@ class MinimapNavigator:
                 candidates.append(best_local)
         if not candidates:
             return None
-        candidates.sort(key=lambda item: (item["geometry"], item["score"]), reverse=True)
+        candidates.sort(key=lambda item: (item["geometry"], item["patch_score"]), reverse=True)
         best = candidates[0]
         second_geometry = candidates[1]["geometry"] if len(candidates) > 1 else 0.0
         gap = best["geometry"] - second_geometry
@@ -349,7 +365,11 @@ class MinimapNavigator:
         )
         return {
             "valid": valid,
-            "score": best["score"],
+            # The public score is the full visible-map geometric F-score.
+            # Patch correlation is only a coarse candidate-voting signal and
+            # should not be reported as the map's final match accuracy.
+            "score": best["geometry"],
+            "patch_score": best["patch_score"],
             "geometry": best["geometry"],
             "gap": gap,
             "coverage": best["coverage"],
@@ -385,15 +405,22 @@ class MinimapNavigator:
         waypoints: list[tuple[float, float]],
         farthest: bool = False,
     ) -> Optional[tuple[int, int]]:
-        if not alignment or not alignment.get("valid") or safe_mask is None or player is None or not waypoints:
+        if not alignment or not alignment.get("valid") or safe_mask is None or self.cell_map is None or player is None or not waypoints:
             return None
         scale, (ox, oy) = alignment["scale"], alignment["origin"]
         player_x, player_y = player
         map_x, map_y = (player_x - ox) / scale, (player_y - oy) / scale
         ref_h, ref_w = safe_mask.shape[:2]
-        if not (0 <= map_x < ref_w and 0 <= map_y < ref_h and safe_mask[int(map_y), int(map_x)] > 0):
+        if not (0 <= map_x < ref_w and 0 <= map_y < ref_h and self.cell_map.walkable[int(map_y), int(map_x)] > 0):
             return None
-        ys, xs = np.where(safe_mask > 0)
+        _, components = cv2.connectedComponents(
+            (self.cell_map.walkable > 0).astype(np.uint8), connectivity=4
+        )
+        component = int(components[int(map_y), int(map_x)])
+        if component == 0:
+            return None
+        walkable = components == component
+        ys, xs = np.where((safe_mask > 0) & walkable)
         if len(xs) == 0:
             return None
         ref_xs, ref_ys = xs.astype(np.float32) + 0.5, ys.astype(np.float32) + 0.5
@@ -408,11 +435,16 @@ class MinimapNavigator:
         if not np.any(visible):
             return None
 
-        signature = (safe_mask.shape, len(waypoints), waypoints[0], waypoints[-1])
-        points = np.asarray(waypoints, dtype=np.float32)
+        points = np.asarray([
+            point for point in waypoints
+            if walkable[int(point[1]), int(point[0])] and safe_mask[int(point[1]), int(point[0])] > 0
+        ], dtype=np.float32)
+        if len(points) == 0:
+            return None
+        signature = (safe_mask.shape, component, len(points), tuple(points[0]), tuple(points[-1]))
         if self.route is None or self.route.signature != signature:
             nearest = int(np.argmin(np.hypot(points[:, 0] - map_x, points[:, 1] - map_y)))
-            self.route = MinimapRoute(signature, tuple(waypoints), nearest)
+            self.route = MinimapRoute(signature, tuple(points), nearest)
         else:
             self._check_route_progress((map_x, map_y))
             # Camera movement can carry the player a long way from the old
@@ -426,11 +458,20 @@ class MinimapNavigator:
             if np.hypot(points[current_index, 0] - map_x, points[current_index, 1] - map_y) > reanchor_distance:
                 self.route.index = int(np.argmin(np.hypot(points[:, 0] - map_x, points[:, 1] - map_y)))
         if farthest:
-            index = int(np.argmax(np.where(visible, distances, -np.inf)))
-            chosen_ref = np.array([ref_xs[index], ref_ys[index]], dtype=np.float32)
-            self.route.index = int(np.argmin(np.hypot(points[:, 0] - chosen_ref[0], points[:, 1] - chosen_ref[1])))
-            self.last_route_target = (int(round(ref_xs[index])), int(round(ref_ys[index])))
-            return int(round(screen_xs[index])), int(round(screen_ys[index]))
+            waypoint_screen_xs = ox + points[:, 0] * scale
+            waypoint_screen_ys = oy + points[:, 1] * scale
+            waypoint_distances = np.hypot(waypoint_screen_xs - player_x, waypoint_screen_ys - player_y)
+            waypoint_visible = (
+                (waypoint_screen_xs >= margin_x) & (waypoint_screen_xs <= fw - margin_x)
+                & (waypoint_screen_ys >= margin_y) & (waypoint_screen_ys <= fh - margin_y)
+                & (waypoint_distances >= self.config.minimap_min_click_distance * fw / 1600.0)
+            )
+            if not np.any(waypoint_visible):
+                return None
+            index = int(np.argmax(np.where(waypoint_visible, waypoint_distances, -np.inf)))
+            self.route.index = index
+            self.last_route_target = (int(round(points[index, 0])), int(round(points[index, 1])))
+            return int(round(waypoint_screen_xs[index])), int(round(waypoint_screen_ys[index]))
         points = np.asarray(self.route.waypoints, dtype=np.float32)
         current = int(self.route.index)
         target_index = (current + 1) % len(points)
@@ -515,7 +556,8 @@ class MinimapNavigator:
             alignment = self.align(frame, reference_image)
         if not alignment or not alignment.get("valid"):
             details = alignment or {}
-            return self._fail(icon, f"[!] Minimap alignment rejected (match {details.get('score', 0.0):.2f}, geometry {details.get('geometry', 0.0):.2f}, coverage {details.get('coverage', 0.0):.2f}, gap {details.get('gap', 0.0):.2f}); no movement tap sent.")
+            self._save_alignment_comparison(frame, reference_image, alignment)
+            return self._fail(icon, f"[!] Minimap alignment rejected (map score {details.get('score', 0.0):.2f}, patch vote {details.get('patch_score', 0.0):.2f}, coverage {details.get('coverage', 0.0):.2f}, gap {details.get('gap', 0.0):.2f}); no movement tap sent.")
         reference = self.templates.get(reference_name) if reference_name is not None else None
         if reference is None:
             return self._fail(icon, "[!] Minimap reference disappeared during registration; no movement tap sent.")
@@ -538,7 +580,8 @@ class MinimapNavigator:
             (player[1] - alignment["origin"][1]) / alignment["scale"],
         )
         mode = "farthest visible" if farthest else "route"
-        print(f"[~] Minimap {mode} waypoint {destination} on {reference_name} from player {player} at map position ({player_map_position[0]:.1f}, {player_map_position[1]:.1f}) toward reference {self.last_route_target or '?'} (match {alignment['score']:.2f}, geometry {alignment['geometry']:.2f}, coverage {alignment['coverage']:.2f}, gap {alignment['gap']:.2f}, scale {alignment['scale']:.2f}).")
+        patch_score = alignment.get("patch_score", alignment["score"])
+        print(f"[~] Minimap {mode} waypoint {destination} on {reference_name} from player {player} at map position ({player_map_position[0]:.1f}, {player_map_position[1]:.1f}) toward reference {self.last_route_target or '?'} (map score {alignment['score']:.2f}, patch vote {patch_score:.2f}, coverage {alignment['coverage']:.2f}, gap {alignment['gap']:.2f}, scale {alignment['scale']:.2f}).")
         sent = self.device.click(*destination, synchronous=True)
         if sent and not farthest and self.route is not None and self.route.waypoints:
             self.route.last_player_position = player_map_position
@@ -570,6 +613,107 @@ class MinimapNavigator:
             retry_icon = self.vision.back_icon(latest) if latest is not None else icon
             closed = self._close_map(retry_icon)
         return bool(sent and closed)
+
+    def _save_alignment_comparison(
+        self,
+        frame: np.ndarray,
+        reference: np.ndarray,
+        alignment: Optional[dict[str, Any]],
+        output_path: Optional[Path] = None,
+    ) -> Optional[Path]:
+        """Save the exact rejected frame beside its projected map comparison."""
+        try:
+            cell_map = self.cell_map or self._build_cell_map(reference)
+            target = cell_map.walls
+            context = cell_map.context_walls
+            expected = cell_map.match_walls
+            map_h, map_w = expected.shape
+            comparison = np.full((map_h, map_w, 3), (32, 32, 32), dtype=np.uint8)
+            overlay = frame.copy()
+            if alignment is not None and "origin" in alignment and "scale" in alignment:
+                scale = float(alignment["scale"])
+                ox, oy = alignment["origin"]
+                fh, fw = frame.shape[:2]
+                sample = max(3, int(round(scale * 0.72)))
+                center_x = np.rint(ox + (np.arange(map_w) + 0.5) * scale).astype(np.int32)
+                center_y = np.rint(oy + (np.arange(map_h) + 0.5) * scale).astype(np.int32)
+                x1, y1 = center_x - sample // 2, center_y - sample // 2
+                x2, y2 = x1 + sample, y1 + sample
+                visible = ((x1 >= 0) & (x2 <= fw))[None, :] & ((y1 >= 0) & (y2 <= fh))[:, None]
+                x1c, x2c = np.clip(x1, 0, fw), np.clip(x2, 0, fw)
+                y1c, y2c = np.clip(y1, 0, fh), np.clip(y2, 0, fh)
+                white = cv2.inRange(frame, (220, 220, 220), (255, 255, 255)) // 255
+                integral = cv2.integral(white, sdepth=cv2.CV_32S)
+                sums = (
+                    integral[y2c[:, None], x2c[None, :]]
+                    - integral[y1c[:, None], x2c[None, :]]
+                    - integral[y2c[:, None], x1c[None, :]]
+                    + integral[y1c[:, None], x1c[None, :]]
+                )
+                observed = (sums >= sample * sample * 0.30) & visible
+                comparison[~visible] = (72, 72, 72)
+                comparison[target & visible] = (0, 0, 220)  # target wall missed
+                comparison[target & observed] = (0, 210, 0)  # target wall hit
+                comparison[context & visible] = (0, 125, 255)  # context wall missed
+                comparison[context & observed] = (255, 220, 0)  # context wall hit
+                comparison[observed & visible & ~expected & ~cell_map.annotations] = (255, 0, 0)
+
+                for mask, color in (
+                    (target & observed, (0, 255, 0)),
+                    (target & visible & ~observed, (0, 0, 255)),
+                    (context & observed, (255, 255, 0)),
+                    (context & visible & ~observed, (0, 150, 255)),
+                    (observed & visible & ~expected & ~cell_map.annotations, (255, 0, 0)),
+                ):
+                    ys, xs = np.where(mask)
+                    for x, y in zip(xs, ys):
+                        px = int(round(ox + (x + 0.5) * scale))
+                        py = int(round(oy + (y + 0.5) * scale))
+                        cv2.circle(overlay, (px, py), max(2, int(scale * 0.13)), color, -1)
+
+                player = self.player_marker(frame)
+                if player is not None:
+                    cv2.circle(overlay, player, 9, (0, 255, 255), 2)
+
+            def fit(image: np.ndarray, width: int, height: int) -> np.ndarray:
+                ratio = min(width / image.shape[1], height / image.shape[0])
+                size = (int(round(image.shape[1] * ratio)), int(round(image.shape[0] * ratio)))
+                return cv2.resize(image, size, interpolation=cv2.INTER_NEAREST)
+
+            panel_w, panel_h, gap = 565, 450, 18
+            live_w = 800
+            header_h = 86
+            canvas = np.full((header_h + panel_h + 28, panel_w * 2 + live_w + gap * 2, 3), 20, dtype=np.uint8)
+            details = alignment or {}
+            summary = (
+                f"valid={details.get('valid', False)}  map={details.get('score', 0.0):.2f}  "
+                f"patch={details.get('patch_score', 0.0):.2f}  coverage={details.get('coverage', 0.0):.2f}  "
+                f"gap={details.get('gap', 0.0):.2f}  origin={details.get('origin', '?')}  scale={details.get('scale', '?')}"
+            )
+            cv2.putText(canvas, "Minimap alignment comparison (saved from this exact frame)", (16, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (245, 245, 245), 2, cv2.LINE_AA)
+            cv2.putText(canvas, summary, (16, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (210, 210, 210), 1, cv2.LINE_AA)
+            left_x, middle_x, right_x = 0, panel_w + gap, panel_w + gap + live_w + gap
+            labels = ((left_x + 12, "REFERENCE PALETTE"), (middle_x + 12, "LIVE FRAME + PROJECTED WALL CELLS"), (right_x + 12, "CELL-BY-CELL MATCH"))
+            for x, label in labels:
+                cv2.putText(canvas, label, (x, header_h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (235, 235, 235), 1, cv2.LINE_AA)
+            y0 = header_h
+            ref_view = fit(reference, panel_w - 12, panel_h - 14)
+            live_view = fit(overlay, live_w, panel_h - 14)
+            compare_view = fit(cv2.resize(comparison, (map_w * 5, map_h * 5), interpolation=cv2.INTER_NEAREST), panel_w - 12, panel_h - 14)
+            canvas[y0:y0 + ref_view.shape[0], left_x + (panel_w - ref_view.shape[1]) // 2:left_x + (panel_w + ref_view.shape[1]) // 2] = ref_view
+            canvas[y0:y0 + live_view.shape[0], middle_x + (live_w - live_view.shape[1]) // 2:middle_x + (live_w + live_view.shape[1]) // 2] = live_view
+            canvas[y0:y0 + compare_view.shape[0], right_x + (panel_w - compare_view.shape[1]) // 2:right_x + (panel_w + compare_view.shape[1]) // 2] = compare_view
+            footer_y = header_h + panel_h + 16
+            cv2.putText(canvas, "Match grid: green=target wall hit, red=miss; cyan=context wall hit, orange=miss; blue=unexpected bright cell; gray=off-screen.", (14, footer_y), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (210, 210, 210), 1, cv2.LINE_AA)
+            path = output_path or (Path(__file__).resolve().parents[1] / "minimap_alignment_latest.png")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not cv2.imwrite(str(path), canvas):
+                return None
+            print(f"[!] Saved minimap alignment comparison: {path}")
+            return path
+        except (OSError, cv2.error, ValueError) as error:
+            print(f"[!] Could not save minimap alignment comparison: {error}")
+            return None
 
     def _fail(self, icon: Optional[tuple[int, int]], message: str) -> bool:
         print(message)

@@ -16,6 +16,11 @@ class _AlwaysExhaustedVision:
         return True
 
 
+class _ClearedCaptionVision:
+    def exhausted_caption(self, frame, template):
+        return False
+
+
 class _Templates:
     def get(self, key):
         return None
@@ -90,6 +95,39 @@ class ExhaustionBehaviorTests(unittest.TestCase):
         self.assertEqual(bot.state.consecutive_exhausted, 1)
         self.assertFalse(bot.state.exhausted_travel_pending)
         self.assertEqual(bot.state.exhausted_window_started_at, 70.1)
+
+    def test_cleared_caption_releases_pending_unconfirmed_target(self):
+        bot = self._bot()
+        bot.vision = _ClearedCaptionVision()
+        target = {"click_x": 800, "click_y": 354}
+        bot.state.current_target = target
+        bot.state.exhausted_caption_target = target
+        bot.state.exhausted_caption_check_at = 25.0
+        bot.state.consecutive_exhausted = 1
+        bot.state.exhausted_window_started_at = 10.0
+
+        bot._check_exhausted_caption(np.zeros((900, 1600, 3), dtype=np.uint8), 25.0)
+
+        self.assertIsNone(bot.state.current_target)
+        self.assertFalse(bot.state.confirmed_locked)
+        self.assertTrue(bot.state.idle_mark_check_needed)
+        self.assertEqual(bot.state.no_target_since, 25.0)
+        self.assertEqual(bot.state.consecutive_exhausted, 0)
+        self.assertIsNone(bot.state.exhausted_window_started_at)
+
+    def test_cleared_caption_keeps_confirmed_target(self):
+        bot = self._bot()
+        bot.vision = _ClearedCaptionVision()
+        target = {"click_x": 800, "click_y": 354}
+        bot.state.current_target = target
+        bot.state.exhausted_caption_target = target
+        bot.state.exhausted_caption_check_at = 25.0
+        bot.state.confirmed_locked = True
+
+        bot._check_exhausted_caption(np.zeros((900, 1600, 3), dtype=np.uint8), 25.0)
+
+        self.assertIs(bot.state.current_target, target)
+        self.assertTrue(bot.state.confirmed_locked)
 
     def test_target_scanner_has_no_position_blacklist_parameter(self):
         self.assertNotIn("blacklist", inspect.signature(FrameVision.find_targets).parameters)

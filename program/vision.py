@@ -12,7 +12,7 @@ from .models import TargetMatch
 
 class TemplateStore:
     BUILT_IN_NAMES = {
-        "skeleton_lv75", "purple_name_skeleton_lv75", "minimapicon", "backicon",
+        "skeleton_lv75", "minimapicon", "backicon",
         "minimap-skeleton-layout", "minimap-zombie-layout",
         "pickup-available", "pickup-not-yet", "exhausted-caption",
     }

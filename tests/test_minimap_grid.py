@@ -18,16 +18,23 @@ class MinimapGridTests(unittest.TestCase):
             BotConfig(), FrameVision(), None, None, "minimap-skeleton-layout"
         )
 
-    def test_template_is_read_as_cells_and_outside_is_not_safe(self):
+    def test_template_palette_keeps_destinations_on_black_walkable_path(self):
         cell_map = self.navigator._build_cell_map(self.reference)
         self.assertEqual(cell_map.walls.shape, (71, 113))
         self.assertEqual(int(cell_map.walls.sum()), 648)
-        self.assertEqual(int(cell_map.outside.sum()), 471)
+        self.assertEqual(int(cell_map.context_walls.sum()), 471)
+        self.assertEqual(int(cell_map.unwalkable.sum()), 4060)
         self.assertEqual(int(cell_map.annotations.sum()), 7)
-        self.assertFalse(np.any(cell_map.safe_mask[cell_map.outside]))
+        self.assertEqual(int(np.count_nonzero(cell_map.walkable)), 2837)
+        self.assertEqual(int(np.count_nonzero(cell_map.match_walls)), 1119)
+        self.assertFalse(np.any(cell_map.safe_mask[cell_map.context_walls]))
+        self.assertFalse(np.any(cell_map.safe_mask[cell_map.unwalkable]))
         self.assertFalse(np.any(cell_map.safe_mask[cell_map.walls]))
+        self.assertFalse(np.any(cell_map.safe_mask[cell_map.annotations]))
+        self.assertFalse(np.any(cell_map.safe_mask & (cell_map.walkable == 0)))
         for x, y in self.navigator.build_waypoints(cell_map.safe_mask):
             self.assertGreater(cell_map.safe_mask[int(y), int(x)], 0)
+            self.assertGreater(cell_map.walkable[int(y), int(x)], 0)
 
     def test_nonuniform_antialiased_cell_is_rejected(self):
         damaged = self.reference.copy()
@@ -35,11 +42,17 @@ class MinimapGridTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "non-uniform"):
             self.navigator._build_cell_map(damaged)
 
+    def test_unknown_uniform_palette_color_is_rejected(self):
+        damaged = self.reference.copy()
+        damaged[:MAP_CELL_PIXELS, :MAP_CELL_PIXELS] = (12, 34, 56)
+        with self.assertRaisesRegex(ValueError, "documented color palette"):
+            self.navigator._build_cell_map(damaged)
+
     def test_registration_recovers_shifted_cell_map_with_occlusion(self):
         cell_map = self.navigator._build_cell_map(self.reference)
         frame = np.zeros((900, 1600, 3), dtype=np.uint8)
         origin_x, origin_y = -315, -210
-        ys, xs = np.where(cell_map.walls)
+        ys, xs = np.where(cell_map.match_walls)
         for cell_y, cell_x in zip(ys, xs):
             x1 = origin_x + int(cell_x) * MAP_CELL_PIXELS
             y1 = origin_y + int(cell_y) * MAP_CELL_PIXELS
@@ -54,6 +67,8 @@ class MinimapGridTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertTrue(result["valid"], result)
         self.assertGreater(result["geometry"], 0.70, result)
+        self.assertEqual(result["score"], result["geometry"])
+        self.assertIn("patch_score", result)
         self.assertLessEqual(abs(result["origin"][0] - origin_x), 7, result)
         self.assertLessEqual(abs(result["origin"][1] - origin_y), 7, result)
         self.assertGreaterEqual(result["coverage"], 0.35, result)

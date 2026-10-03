@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 PROFILE_FILE = Path(__file__).resolve().parent.parent / "zone_profiles.json"
 
@@ -14,15 +13,11 @@ class ZoneProfile:
     key: str
     target_name: str
     target_template_key: str
-    target_purple_template_key: Optional[str]
     minimap_template_key: str
 
     @property
     def template_keys(self) -> tuple[str, ...]:
-        keys = [self.target_template_key, self.minimap_template_key]
-        if self.target_purple_template_key:
-            keys.append(self.target_purple_template_key)
-        return tuple(keys)
+        return self.target_template_key, self.minimap_template_key
 
 
 @dataclass(frozen=True)
@@ -59,16 +54,10 @@ def load_profile_settings(path: Path = PROFILE_FILE) -> ProfileSettings:
         target_name = raw.get("target_name")
         if not isinstance(target_name, str) or not target_name.strip():
             raise ValueError(f"Profile '{key}' needs a non-empty 'target_name'.")
-        purple_raw = raw.get("purple_name_template")
-        purple_key = (
-            _template_key(purple_raw, "purple_name_template", key)
-            if purple_raw is not None else None
-        )
         profiles[key] = ZoneProfile(
             key=key,
             target_name=target_name.strip(),
             target_template_key=_template_key(raw.get("name_template"), "name_template", key),
-            target_purple_template_key=purple_key,
             minimap_template_key=_template_key(raw.get("minimap_template"), "minimap_template", key),
         )
 

@@ -46,12 +46,6 @@ class RucoyBot:
             )
             return False
         self.target_templates = [(exact, "white")]
-        purple_key = self.profile.target_purple_template_key
-        purple = images.get(purple_key) if purple_key else None
-        if purple is not None:
-            self.target_templates.append((purple, "purple"))
-        elif purple_key:
-            print(f"[~] Optional purple target template '{purple_key}' is unavailable.")
         self.device = InputDevice.connect(self.config)
         if self.device is None:
             return False
@@ -319,7 +313,19 @@ class RucoyBot:
                 state.idle_mark_check_needed = False
                 state.no_target_since = now
             else:
-                print("[+] Exhausted caption cleared; keeping the current target.")
+                self._reset_exhaustion_streak()
+                if state.confirmed_locked:
+                    print("[+] Exhausted caption cleared; keeping the confirmed target.")
+                else:
+                    tx, ty = state.current_target["click_x"], state.current_target["click_y"]
+                    print(
+                        "[+] Exhausted caption cleared before red-square lock; "
+                        f"releasing pending target at ({tx}, {ty}) and rescanning."
+                    )
+                    state.current_target = None
+                    state.confirmed_locked = False
+                    state.idle_mark_check_needed = True
+                    state.no_target_since = now
         elif due:
             state.exhausted_caption_next_poll = now + cfg.exhausted_caption_poll_seconds
             if caption_visible:
