@@ -17,8 +17,50 @@ A fully autonomous AFK hunting bot for **Rucoy Online**, built with Python and O
 | **Minimap Navigation** | Aligns the visible minimap overlay to a full-map reference using integral-image scoring, then follows a sweep route through safe walkable cells |
 | **Exhaustion Failsafe** | After repeated "exhausted" targets, jumps to the farthest visible map point to escape depleted areas |
 | **UI Recovery** | Auto-dismisses disconnect screens, unexpected panels, and overlay menus |
+| **Auto Potion** | Monitors HP/MP bar fill via vectorized pixel scanning and auto-taps potions with cooldown protection |
 | **Output Watchdog** | Detects infinite warning loops and restarts the bot engine automatically |
 | **Zone Profiles** | Switch between mob types and maps via `zone_profiles.json` |
+
+---
+
+## Auto-Potion & HP Detection Guide
+
+The bot monitors character vitals in real time and automatically triggers potion taps via ADB when health or mana drops below configured thresholds.
+
+### Detection Mechanism
+
+- **HP Bar**: Scans the top-left red health bar (`y=4..45, x=4..460`, color `#cf3232` / BGR `50, 50, 207`)
+- **MP Bar**: Scans the top-left blue mana bar (`y=50..62, x=4..460`, color `#3cbcfc` / BGR `252, 188, 60`)
+- **Fill Calculation**: Uses vectorized NumPy column scanning to detect the rightmost filled column, avoiding single-pixel sampling errors caused by text or UI artifacts.
+
+### HP Bar Text Overlay Behavior
+
+In Rucoy Online, character current/max HP text (e.g., `475/475`) is rendered directly over the center of the HP bar, spanning columns `x ≈ 174` to `x ≈ 329` (roughly 37% to 72% of total bar width). Because the text digits replace the red bar pixels vertically across those columns, the rightmost detected red column behaves as follows:
+
+| Threshold Setting | Effective Trigger Point | Accuracy | Notes |
+|---|---|---|---|
+| `0.75` - `0.95` | Exact (75% - 95%) | High | Health bar edge is to the right of text overlay. Reliable for high-risk hunting. |
+| `0.70` (default) | ~72% | High | Triggers slightly early as the bar enters the text zone. Safe and conservative. |
+| `0.40` - `0.65` | ~72% | Fixed | The text overlay covers the edge within this range. Any threshold in this bracket triggers at the right text boundary (~72%). |
+| `0.10` - `0.35` | Exact (10% - 35%) | High | Health bar edge is to the left of text overlay. Suitable for emergency-only potion use. |
+
+> **Note on Mana (MP):** The MP bar does **not** have numeric text overlay. Thresholds for `mp_potion_threshold` (default `0.50`) are 100% linear and precise from `0.01` to `1.00`.
+
+### Configuration Options
+
+Potion parameters can be adjusted in `program/config.py`:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `auto_potion_enabled` | `True` | Master toggle for potion detection and usage |
+| `hp_potion_threshold` | `0.70` | HP ratio below which HP potion is tapped (triggers at ~72% actual) |
+| `mp_potion_threshold` | `0.50` | MP ratio below which Mana potion is tapped (exact linear scale) |
+| `pvp_mode` | `False` | Toggles higher polling frequency for PvP or dangerous zones |
+| `potion_check_interval`| `0.50` | Check interval in seconds during normal farming |
+| `pvp_potion_check_interval` | `0.15` | Check interval in seconds when `pvp_mode` is enabled |
+| `potion_cooldown` | `0.40` | Minimum delay in seconds between potion taps |
+| `hp_potion_tap` | `(60, 745)` | Screen coordinates (x, y) for HP potion button |
+| `mana_potion_tap` | `(60, 610)` | Screen coordinates (x, y) for Mana potion button |
 
 ---
 
