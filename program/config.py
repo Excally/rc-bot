@@ -58,6 +58,17 @@ class BotConfig:
     exhausted_travel_hold_seconds: float = 10.0
     repeated_output_limit: int = 200
 
+    # Auto potion
+    auto_potion_enabled: bool = True
+    hp_potion_threshold: float = 0.70
+    mp_potion_threshold: float = 0.50
+    potion_check_interval: float = 0.5
+    pvp_potion_check_interval: float = 0.1
+    pvp_mode: bool = False
+    potion_cooldown: float = 1.0
+    hp_potion_tap: tuple[int, int] = (60, 745)
+    mana_potion_tap: tuple[int, int] = (60, 610)
+
 
 CONFIG = BotConfig()
 TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "templates"

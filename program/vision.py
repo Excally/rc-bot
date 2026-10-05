@@ -57,6 +57,51 @@ class FrameVision:
             tuple[int, str, float], tuple[np.ndarray, np.ndarray]
         ] = {}
 
+    # HP/MP bar geometry at 1600x900.
+    _BAR_X_START = 4
+    _BAR_X_END = 460
+    _HP_BAR_Y_START = 4
+    _HP_BAR_Y_END = 45
+    _MP_BAR_Y_START = 50
+    _MP_BAR_Y_END = 62
+    _HP_COLOR_BGR = np.array([50, 50, 207], dtype=np.int16)   # #cf3232
+    _MP_COLOR_BGR = np.array([252, 188, 60], dtype=np.int16)  # #3cbcfc
+    _BAR_COLOR_TOLERANCE = 30
+
+    def _bar_fill(self, frame: np.ndarray, y_start: int, y_end: int,
+                  color: np.ndarray) -> float:
+        """Return the fill fraction (0.0–1.0) of a horizontal bar.
+
+        The text overlay (e.g. '475/475') blocks the bar color in the center,
+        so we scan columns from the right edge inward.  A column counts as
+        filled if ANY pixel in the vertical slice matches the bar color.
+        """
+        xs, xe = self._BAR_X_START, self._BAR_X_END
+        # Extract the bar region as int16 for safe subtraction.
+        strip = frame[y_start:y_end + 1, xs:xe + 1].astype(np.int16)
+        # For each column, check if any row matches the bar color.
+        diff = np.abs(strip - color)  # shape: (rows, cols, 3)
+        match = np.all(diff <= self._BAR_COLOR_TOLERANCE, axis=2)  # (rows, cols)
+        col_has_color = np.any(match, axis=0)  # (cols,)
+        # Find the rightmost column with the bar color.
+        indices = np.where(col_has_color)[0]
+        if len(indices) == 0:
+            return 0.0
+        rightmost = int(indices[-1])
+        return (rightmost + 1) / (xe - xs + 1)
+
+    def hp_below_threshold(self, frame: np.ndarray, threshold: float) -> bool:
+        """True if the HP bar has depleted past *threshold* (0.0–1.0)."""
+        return self._bar_fill(
+            frame, self._HP_BAR_Y_START, self._HP_BAR_Y_END, self._HP_COLOR_BGR,
+        ) < threshold
+
+    def mp_below_threshold(self, frame: np.ndarray, threshold: float) -> bool:
+        """True if the MP bar has depleted past *threshold* (0.0–1.0)."""
+        return self._bar_fill(
+            frame, self._MP_BAR_Y_START, self._MP_BAR_Y_END, self._MP_COLOR_BGR,
+        ) < threshold
+
     @staticmethod
     def is_disconnected(frame: Optional[np.ndarray]) -> bool:
         if frame is None:

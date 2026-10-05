@@ -35,3 +35,6 @@ class BotState:
     exhausted_travel_pending: bool = False
     last_ui_state: str = "other"
     next_ui_check_at: float = 0.0
+    last_potion_check_at: float = 0.0
+    last_hp_potion_at: float = 0.0
+    last_mp_potion_at: float = 0.0

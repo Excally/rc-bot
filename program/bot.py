@@ -97,6 +97,15 @@ class RucoyBot:
         )
         preview_status = "ON (Press q in preview window to exit)" if self.config.show_preview else "OFF (Press Ctrl+C in terminal to exit)"
         print(f"[+] Preview: {preview_status}")
+        if self.config.auto_potion_enabled:
+            mode = "PvP" if self.config.pvp_mode else "PvE"
+            print(
+                f"[+] Auto potion: ON ({mode}) "
+                f"HP<{int(self.config.hp_potion_threshold * 100)}% "
+                f"MP<{int(self.config.mp_potion_threshold * 100)}%"
+            )
+        else:
+            print("[+] Auto potion: OFF")
         print("\n[+] Hunting loop started! You can work while bot is AFK.\n")
 
     def run(self) -> None:
@@ -148,6 +157,8 @@ class RucoyBot:
             self._recover_ui(frame, ui_state, now)
             time.sleep(0.08)
             return
+        # Potion check runs every frame in combat regardless of target state.
+        self._check_potions(frame, now)
         # Finish a pending loot tap before selecting the next mob. Sending it
         # after target acquisition can immediately steal the game's focus.
         if state.current_target is None and state.pickup_pending:
@@ -548,6 +559,27 @@ class RucoyBot:
         )
         distance = np.hypot(nearest["click_x"] - tx, nearest["click_y"] - ty)
         return nearest if distance <= match_radius else None
+
+    def _check_potions(self, frame: np.ndarray, now: float) -> None:
+        cfg = self.config
+        if not cfg.auto_potion_enabled:
+            return
+        interval = cfg.pvp_potion_check_interval if cfg.pvp_mode else cfg.potion_check_interval
+        if now - self.state.last_potion_check_at < interval:
+            return
+        self.state.last_potion_check_at = now
+        if now - self.state.last_hp_potion_at >= cfg.potion_cooldown:
+            if self.vision.hp_below_threshold(frame, cfg.hp_potion_threshold):
+                assert self.device is not None
+                self.device.click(*cfg.hp_potion_tap)
+                self.state.last_hp_potion_at = now
+                print(f"[+] HP below {int(cfg.hp_potion_threshold * 100)}%; using HP potion.")
+        if now - self.state.last_mp_potion_at >= cfg.potion_cooldown:
+            if self.vision.mp_below_threshold(frame, cfg.mp_potion_threshold):
+                assert self.device is not None
+                self.device.click(*cfg.mana_potion_tap)
+                self.state.last_mp_potion_at = now
+                print(f"[+] MP below {int(cfg.mp_potion_threshold * 100)}%; using mana potion.")
 
     def _preview(self, frame: np.ndarray, cx: int, cy: int) -> None:
         if not self.config.show_preview:
