@@ -1,4 +1,4 @@
-# 🤖 Rucoy Bot
+# Rucoy Bot
 
 A fully autonomous AFK hunting bot for **Rucoy Online**, built with Python and OpenCV. It detects mobs by nameplate, locks targets with pixel-precise red-outline tracking, handles loot pickups, recovers from UI interruptions, and navigates farm zones using minimap template matching — all running silently in the background via ADB.
 
@@ -6,7 +6,7 @@ A fully autonomous AFK hunting bot for **Rucoy Online**, built with Python and O
 
 ---
 
-## ✨ Features
+## Features
 
 | Feature | How it works |
 |---|---|
@@ -22,7 +22,7 @@ A fully autonomous AFK hunting bot for **Rucoy Online**, built with Python and O
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 **Requirements:** Python 3.10+, BlueStacks/MSI App Player at **1600×900**, 240 DPI, 100% interface scale.
 
@@ -45,7 +45,7 @@ Press `Ctrl+C` in the terminal to stop cleanly.
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 ```
 bot.py                  ← Entry point
@@ -72,7 +72,7 @@ Key design rules:
 
 ---
 
-## 🗺️ Minimap Templates
+## Minimap Templates
 
 Templates live in `templates/` and are loaded at runtime.
 
@@ -87,7 +87,7 @@ Templates live in `templates/` and are loaded at runtime.
 
 ---
 
-## ⚙️ Emulator Setup
+## Emulator Setup
 
 The bot connects via **local BlueStacks ADB** first, falling back to Win32 window capture.
 
@@ -104,7 +104,7 @@ The bot connects via **local BlueStacks ADB** first, falling back to Win32 windo
 
 ---
 
-## 🧪 Tests
+## Tests
 
 ```bash
 python -m unittest discover -s tests -v
@@ -114,12 +114,12 @@ Tests cover target locking logic, exhaustion behavior, minimap grid validation, 
 
 ---
 
-## 📦 Releases
+## Releases
 
 Release notes and version history are published on [GitHub Releases](https://github.com/Excally/rc-bot/releases).
 
 ---
 
-## ⚠️ Disclaimer
+## Disclaimer
 
 Image matching and simulated tests cannot guarantee that every in-game tap will succeed. **Always observe behavior in-game before leaving the bot unattended.**
