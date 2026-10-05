@@ -1,37 +1,125 @@
-# Rucoy Bot
+# 🤖 Rucoy Bot
 
-Rucoy Bot is a Python automation project for hunting configured mobs in Rucoy Online. It finds and tracks targets from the live screen, handles pickup prompts and unexpected UI panels, and can travel within a farm zone by matching the visible part of the in-game minimap to a full-map template. Minimap routes stay inside the template's marked farm area and check whether movement actually occurred before continuing.
+A fully autonomous AFK hunting bot for **Rucoy Online**, built with Python and OpenCV. It detects mobs by nameplate, locks targets with pixel-precise red-outline tracking, handles loot pickups, recovers from UI interruptions, and navigates farm zones using minimap template matching — all running silently in the background via ADB.
 
-## Project Overview
+> **Zero mouse takeover.** The bot sends taps through ADB so your mouse stays free. Minimize the emulator and keep working.
 
-The active implementation is the `program/` Python package. It is split by responsibility so that target recognition, screen input, minimap navigation, configuration, and the main combat loop can be worked on separately instead of being tangled in one large script.
+---
 
-- `program/bot.py` owns the hunting loop, target acquisition, target tracking, pickup handling, and unexpected-UI recovery.
-- `program/vision.py` loads image references and detects mob nameplates, target outlines, pickup prompts, UI icons, and exhausted captions.
-- `program/navigation.py` reads minimap templates as a 21-pixel cell grid, aligns visible white wall cells, excludes red outside cells, and routes only through the enclosed safe area.
-- `program/device.py` captures frames and sends taps or Back input through the supported emulator/window backends.
-- `program/profiles.py` validates the zone profiles in `zone_profiles.json`; `program/config.py` contains shared runtime tuning.
-- `program/state.py`, `program/models.py`, and `program/exceptions.py` contain state and small types used by the bot.
-- `program/diagnostics.py` timestamps output and watches for repeated warning patterns; `program/runner.py` starts the selected profile and supervises the bot loop.
-- `program/cli.py` implements profile selection and inspection commands.
+## ✨ Features
 
-`bot.py` is the main launcher. `skeleton.py` is a compatibility launcher for the same profile-driven program; the selected profile, not the launcher's filename, controls the target and map. The default profile is `skeleton-lv75`. `zombie-lv65` is also configured.
+| Feature | How it works |
+|---|---|
+| **Target Detection** | Finds mob nameplates via template matching on white/purple text masks |
+| **Combat Lock** | Tracks the red selection outline (`marked.png`) with sub-frame persistence |
+| **Smart Retargeting** | Nearest-first selection, retry taps on missed locks, auto-skip unresponsive targets |
+| **Loot Pickup** | Detects and taps the pickup prompt after kills |
+| **Minimap Navigation** | Aligns the visible minimap overlay to a full-map reference using integral-image scoring, then follows a sweep route through safe walkable cells |
+| **Exhaustion Failsafe** | After repeated "exhausted" targets, jumps to the farthest visible map point to escape depleted areas |
+| **UI Recovery** | Auto-dismisses disconnect screens, unexpected panels, and overlay menus |
+| **Output Watchdog** | Detects infinite warning loops and restarts the bot engine automatically |
+| **Zone Profiles** | Switch between mob types and maps via `zone_profiles.json` |
 
-Run from the repository folder with Python 3.10 or newer. Install dependencies with `python -m pip install -r requirements.txt`, then use:
+---
 
-```powershell
+## 🚀 Quick Start
+
+**Requirements:** Python 3.10+, BlueStacks/MSI App Player at **1600×900**, 240 DPI, 100% interface scale.
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# See available profiles
 python bot.py --list-profiles
-python bot.py --show-config
+
+# Run the bot
 python bot.py --profile skeleton-lv75
 python bot.py --profile zombie-lv65
+
+# Or use the package directly
+python -m program --profile skeleton-lv75
 ```
-## Extra Notes
-The active device connector first tries local BlueStacks ADB and falls back to the MSI App Player window backend with the display resolutin around 1600x900 with 240 DPI and interface seting 100%. with Graphic renderer OpenGL, interface renderer Auto, ASTC texture by software, and prefer dedicated GPU. The older Android Wireless Debugging runner is kept at `deprecated/mobile.py`; it is not connected to the active launcher, so `python bot.py` does not currently connect to a phone over Wi-Fi ADB.
 
-Files in `templates/` are visual references used at runtime. Cell-grid minimap templates must have dimensions divisible by 21, use solid 21×21 pixel blocks without antialiasing, and include a closed white outer wall boundary. White cells mark walls, red cells mark outside space, yellow cells are annotations ignored by registration and player detection, and other colors mark floor. `screenshot-stock/` holds saved screenshots and diagnostic captures, not runtime templates. Older implementations are retained under `deprecated/` for reference.
+Press `Ctrl+C` in the terminal to stop cleanly.
 
-The active runner also has a repeated-output watchdog: after the same warning pattern reaches its configured threshold, it restarts the bot engine once. If the same pattern returns after that reset, the runner stops the program rather than restarting endlessly. Output lines include local date and time. Image matching and simulated tests cannot guarantee that every live-game tap will succeed, so observe behavior in-game before leaving it unattended.
+---
 
-## Releases
+## 🏗️ Architecture
 
-Release notes and version history are published on [GitHub Releases](https://github.com/Excally/rc-bot/releases). The README stays focused on what the project does and how to run it.
+```
+bot.py                  ← Entry point
+program/
+├── cli.py              ← Profile selection & CLI args
+├── runner.py           ← Supervised bot restart + output watchdog
+├── bot.py              ← Combat state machine (acquire → lock → track → release)
+├── vision.py           ← All image recognition (stateless, never sends input)
+├── navigation.py       ← Minimap alignment, routing, and travel
+├── device.py           ← ADB / Win32 screen capture and tap input
+├── config.py           ← Frozen runtime tuning parameters
+├── state.py            ← Mutable bot state (current target, timers, flags)
+├── models.py           ← Typed structures (TargetMatch)
+├── profiles.py         ← Zone profile loader & validator
+├── diagnostics.py      ← Timestamped output + repeated-warning detection
+└── exceptions.py       ← Control-flow exceptions (BotQuit, RepeatedOutputReset)
+```
+
+Key design rules:
+- **`vision.py` never sends input** — pure recognition
+- **`device.py` never does CV** — pure I/O
+- **`bot.py` orchestrates** — state machine driving vision + device
+- **`config.py` is frozen** — immutable, separate from mutable state
+
+---
+
+## 🗺️ Minimap Templates
+
+Templates live in `templates/` and are loaded at runtime.
+
+**Cell-grid minimap templates** must follow these rules:
+- Dimensions divisible by **21px** (each cell is a solid 21×21 block, no antialiasing)
+- **Black** cells = walkable floor (route destinations)
+- **White** `(243,243,243)` cells = walls (used for alignment)
+- **Red** `(0,0,255)` cells = context walls from neighboring maps (alignment only, not walkable)
+- **Gray** `(132,132,132)` cells = unwalkable terrain
+- **Yellow** `(0,255,234)` cells = annotations (ignored by alignment and navigation)
+- Must have a closed wall boundary enclosing the farm area
+
+---
+
+## ⚙️ Emulator Setup
+
+The bot connects via **local BlueStacks ADB** first, falling back to Win32 window capture.
+
+**Recommended BlueStacks settings:**
+| Setting | Value |
+|---|---|
+| Display resolution | 1600 × 900 |
+| DPI | 240 |
+| Interface scale | 100% |
+| Graphics renderer | OpenGL |
+| Interface renderer | Auto |
+| ASTC texture | Software |
+| GPU preference | Dedicated |
+
+---
+
+## 🧪 Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Tests cover target locking logic, exhaustion behavior, minimap grid validation, alignment registration, and route progress tracking — all with synthetic frames and mocked devices (no emulator needed).
+
+---
+
+## 📦 Releases
+
+Release notes and version history are published on [GitHub Releases](https://github.com/Excally/rc-bot/releases).
+
+---
+
+## ⚠️ Disclaimer
+
+Image matching and simulated tests cannot guarantee that every in-game tap will succeed. **Always observe behavior in-game before leaving the bot unattended.**
