@@ -33,12 +33,8 @@ class CellMap:
     annotations: np.ndarray
     walkable: np.ndarray
     safe_mask: np.ndarray
-    cell_pixels: int = 21
-
-    @property
-    def match_walls(self) -> np.ndarray:
-        """Both wall layers help registration; only the black path is navigable."""
-        return self.walls | self.context_walls
+    match_walls: np.ndarray
+    walkable_components: np.ndarray
 
 
 MAP_CELL_PIXELS = 21
@@ -124,7 +120,13 @@ class MinimapNavigator:
         safe[clearance > 0] = 0
         if cv2.countNonZero(safe) == 0:
             raise ValueError("The minimap template contains no safe floor cells.")
-        return CellMap(walls, context_walls, unwalkable, annotations, walkable_u8, safe)
+        return CellMap(
+            walls, context_walls, unwalkable, annotations, walkable_u8, safe,
+            match_walls=walls | context_walls,
+            walkable_components=cv2.connectedComponents(
+                (walkable_u8 > 0).astype(np.uint8), connectivity=4,
+            )[1],
+        )
 
     @staticmethod
     def build_waypoints(safe_mask: np.ndarray, grid_step: int = 6) -> list[tuple[float, float]]:
@@ -386,9 +388,7 @@ class MinimapNavigator:
         ref_h, ref_w = safe_mask.shape[:2]
         if not (0 <= map_x < ref_w and 0 <= map_y < ref_h and self.cell_map.walkable[int(map_y), int(map_x)] > 0):
             return None
-        _, components = cv2.connectedComponents(
-            (self.cell_map.walkable > 0).astype(np.uint8), connectivity=4
-        )
+        components = self.cell_map.walkable_components
         component = int(components[int(map_y), int(map_x)])
         if component == 0:
             return None
@@ -532,20 +532,11 @@ class MinimapNavigator:
             self._save_alignment_comparison(frame, reference_image, alignment)
             failed = ", ".join(details.get("failed_checks", ())) or "no candidate details"
             return self._fail(icon, f"[!] Minimap alignment rejected (map {details.get('score', 0.0):.3f}, coverage {details.get('coverage', 0.0):.3f}, gap {details.get('gap', 0.0):.3f}, player walkable {details.get('player_walkable', 'unknown')}, positions {details.get('positions_tested', 0)}; failed: {failed}); no movement tap sent.")
-        reference = self.templates.get(reference_name) if reference_name is not None else None
-        if reference is None:
-            return self._fail(icon, "[!] Minimap reference disappeared during registration; no movement tap sent.")
         player = self.player_marker(frame)
         if player is None:
             return self._fail(icon, "[!] Minimap player marker was not found; no movement tap sent.")
-        if self.reference_id != id(reference) or self.cell_map is None:
-            try:
-                self.cell_map = self._build_cell_map(reference)
-            except ValueError as error:
-                return self._fail(icon, f"[!] Minimap grid rejected: {error}")
-            self.safe_mask = self.cell_map.safe_mask
-            self.waypoints = self.build_waypoints(self.safe_mask)
-            self.reference_id = id(reference)
+        # align() already built cell_map, safe_mask, and waypoints for this
+        # reference when it returned a valid result.
         destination = self.destination(frame, alignment, self.safe_mask, player, self.waypoints, farthest=farthest)
         if destination is None:
             return self._fail(icon, "[!] No safe visible minimap waypoint was found; no movement tap sent.")
@@ -696,16 +687,8 @@ class MinimapNavigator:
         return False
 
     def _close_map(self, icon: Optional[tuple[int, int]]) -> bool:
-        back_template = self.templates.get("backicon")
-
         def panel_closed(frame: np.ndarray) -> bool:
-            if back_template is None:
-                return self.vision.ui_state(frame)[0] == "combat"
-            return self.vision.find_fixed_icon(
-                frame, back_template, self.config.back_icon_center,
-                self.config.back_icon_match_threshold, search_radius=(35, 30),
-                scales=self.config.back_icon_scales,
-            ) is None
+            return self.vision.back_icon(frame) is None
 
         if icon is None:
             self.device.back()
@@ -717,6 +700,11 @@ class MinimapNavigator:
             return False
         else:
             for attempt in range(2):
+                if icon is None:
+                    # The icon vanished between captures but the panel stayed
+                    # open; fall through to the system-Back fallback below.
+                    print("[!] Back icon vanished; trying the system Back action.")
+                    break
                 if not self.device.click(*icon, synchronous=True):
                     print(f"[!] Back-icon tap {attempt + 1} failed.")
                 time.sleep(0.45)
@@ -726,14 +714,10 @@ class MinimapNavigator:
                     break
                 if panel_closed(frame):
                     return True
-                if back_template is None:
+                refreshed = self.vision.back_icon(frame)
+                if refreshed is None:
                     print("[!] Back icon template is unavailable; trying the system Back action.")
                     break
-                refreshed = self.vision.find_fixed_icon(
-                    frame, back_template, self.config.back_icon_center,
-                    self.config.back_icon_match_threshold, search_radius=(35, 30),
-                    scales=self.config.back_icon_scales,
-                )
                 if attempt == 0:
                     icon = refreshed
                     print(f"[!] Back icon remains visible at {icon}; retrying its fresh match.")
@@ -747,7 +731,3 @@ class MinimapNavigator:
         print("[!] Panel is still open after Back-icon and system Back attempts.")
         return False
 
-
-# ---------------------------------------------------------------------------
-# Combat state machine
-# ---------------------------------------------------------------------------

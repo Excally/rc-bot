@@ -58,6 +58,7 @@ class InputDevice:
         self.hwnd = hwnd
         self.use_adb = use_adb
         self._raw_capture_supported: Optional[bool] = None
+        self._mss: Any = None
 
     @classmethod
     def connect(cls, config: BotConfig) -> Optional["InputDevice"]:
@@ -196,18 +197,19 @@ class InputDevice:
 
         try:
             import win32gui
-            from mss import MSS
 
             left, top, right, bottom = win32gui.GetClientRect(self.hwnd)
             width, height = right - left, bottom - top
             if width <= 0 or height <= 0:
                 return None
             screen_x, screen_y = win32gui.ClientToScreen(self.hwnd, (0, 0))
-            with MSS() as screen:
-                shot = np.array(screen.grab({
-                    "left": screen_x, "top": screen_y,
-                    "width": width, "height": height,
-                }))
+            if self._mss is None:
+                from mss import MSS
+                self._mss = MSS()
+            shot = np.array(self._mss.grab({
+                "left": screen_x, "top": screen_y,
+                "width": width, "height": height,
+            }))
             return cv2.cvtColor(shot, cv2.COLOR_BGRA2BGR)
         except Exception:
             return None

@@ -20,9 +20,3 @@ class TargetMatch(TypedDict, total=False):
     red_observations: int
     lock_retry_count: int
 
-
-class RetryContext(TypedDict):
-    x: int
-    y: int
-    grid: tuple[int, int]
-    time: float

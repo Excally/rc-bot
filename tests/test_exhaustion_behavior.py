@@ -52,7 +52,7 @@ class _MapVision:
 class ExhaustionBehaviorTests(unittest.TestCase):
     def _bot(self):
         bot = RucoyBot.__new__(RucoyBot)
-        bot.config = BotConfig()
+        bot.config = BotConfig(exhausted_travel_trigger_count=2)
         bot.state = BotState()
         bot.vision = _AlwaysExhaustedVision()
         bot.templates = _Templates()
@@ -70,14 +70,14 @@ class ExhaustionBehaviorTests(unittest.TestCase):
         bot = self._bot()
 
         self._confirm_exhausted(bot, 10.0)
-        self._confirm_exhausted(bot, 69.0)
+        self._confirm_exhausted(bot, 35.0)
 
         self.assertEqual(bot.state.consecutive_exhausted, 2)
         self.assertTrue(bot.state.exhausted_travel_pending)
         self.assertFalse(hasattr(bot.state, "blacklist"))
         self.assertFalse(hasattr(bot.state, "ignored_exhausted_marker"))
 
-        bot._run_exhausted_travel_failsafe(69.0)
+        bot._run_exhausted_travel_failsafe(35.0)
 
         self.assertEqual(
             bot.navigator.calls,

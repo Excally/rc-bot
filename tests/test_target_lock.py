@@ -56,7 +56,7 @@ class TargetLockTests(unittest.TestCase):
             target_click_time=100.0,
             confirmed_locked=True,
         )
-        bot.device = object()
+        bot.device = _ClickRecorder()
         bot.vision = _MarkerVision(marker_visible)
         bot.target_templates = []
         bot._find_locked_entity = lambda frame, cx, cy, target, now: {
