@@ -11,11 +11,12 @@ from .diagnostics import RepeatedOutputGuard, TimestampedOutputStream
 from .exceptions import RepeatedOutputReset
 from .profiles import ZoneProfile, load_profile_settings
 
-def run_bot(profile: ZoneProfile | None = None) -> None:
+def run_bot(profile: ZoneProfile | None = None, combat_class: str | None = None) -> None:
     """Install the output watchdog and restart the engine once if it loops."""
     if profile is None:
         settings = load_profile_settings()
         profile = settings.profiles[settings.active_profile]
+    chosen_class = combat_class or getattr(profile, "combat_class", "melee") or "melee"
     original_stdout, original_stderr = sys.stdout, sys.stderr
     guard = RepeatedOutputGuard()
     output = original_stdout if isinstance(original_stdout, TimestampedOutputStream) else TimestampedOutputStream(original_stdout, guard)
@@ -26,7 +27,7 @@ def run_bot(profile: ZoneProfile | None = None) -> None:
     try:
         while True:
             try:
-                RucoyBot(profile=profile).run()
+                RucoyBot(profile=profile, combat_class=chosen_class).run()
                 break
             except RepeatedOutputReset as problem:
                 resets += 1

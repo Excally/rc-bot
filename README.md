@@ -12,6 +12,7 @@ A fully autonomous AFK hunting bot for **Rucoy Online**, built with Python and O
 |---|---|
 | **Target Detection** | Finds mob nameplates via template matching on white/purple text masks |
 | **Combat Lock** | Tracks the red selection outline (`marked.png`) with sub-frame persistence |
+| **Combat Classes** | Supports `melee`, `ranged`, and `magic`; auto-steps closer to mobs for ranged/magic |
 | **Smart Retargeting** | Nearest-first selection, retry taps on missed locks, auto-skip unresponsive targets |
 | **Loot Pickup** | Detects and taps the pickup prompt after kills |
 | **Minimap Navigation** | Aligns the visible minimap overlay to a full-map reference using integral-image scoring, then follows a sweep route through safe walkable cells |
@@ -75,13 +76,21 @@ pip install -r requirements.txt
 # See available profiles
 python bot.py --list-profiles
 
-# Run the bot
+# Run the bot (defaults to melee)
 python bot.py --profile skeleton-lv75
-python bot.py --profile zombie-lv65
+
+# Select combat class: melee, ranged, or magic
+python bot.py --profile skeleton-lv75 melee
+python bot.py --profile skeleton-lv75 ranged
+python bot.py --profile skeleton-lv75 magic
 
 # Or use the package directly
-python -m program --profile skeleton-lv75
+python -m program --profile skeleton-lv75 ranged
 ```
+
+### Combat Classes & Approach Mechanics
+- **Melee (Knight)**: Target click automatically moves the character adjacent to the mob via Rucoy's native pathfinding.
+- **Ranged (Archer) & Magic (Mage)**: In Rucoy, targeting a distant mob does not cause the character to walk. When running `ranged` or `magic`, the bot locks the mob and automatically steps closer by tapping halfway on the ground until adjacent or in close range (<100px), then fires.
 
 Press `Ctrl+C` in the terminal to stop cleanly.
 

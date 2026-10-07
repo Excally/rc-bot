@@ -38,3 +38,4 @@ class BotState:
     last_potion_check_at: float = 0.0
     last_hp_potion_at: float = 0.0
     last_mp_potion_at: float = 0.0
+    last_approach_time: float = 0.0

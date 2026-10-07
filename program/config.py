@@ -34,6 +34,8 @@ class BotConfig:
     player_deadzone_radius: int = 90
     match_threshold: float = 0.60
     min_name_template_overlap: float = 0.58
+    min_segment_match_threshold: float = 0.55
+    min_segment_template_overlap: float = 0.65
     target_scan_width: int = 1600
     ui_match_threshold: float = 0.80
     back_icon_match_threshold: float = 0.86
@@ -68,6 +70,13 @@ class BotConfig:
     potion_cooldown: float = 1.0
     hp_potion_tap: tuple[int, int] = (60, 745)
     mana_potion_tap: tuple[int, int] = (60, 610)
+
+    # Combat class & auto-approach
+    combat_class: str = "melee"
+    approach_close_distance: float = 100.0
+    approach_step_fraction: float = 0.5
+    approach_interval: float = 0.7
+    approach_initial_delay: float = 0.25
 
 
 CONFIG = BotConfig()

@@ -17,12 +17,22 @@ from .state import BotState
 from .vision import FrameVision, TemplateStore
 
 class RucoyBot:
-    def __init__(self, config: BotConfig = CONFIG, profile: Optional[ZoneProfile] = None):
+    combat_class: str = "melee"
+
+    def __init__(
+        self,
+        config: BotConfig = CONFIG,
+        profile: Optional[ZoneProfile] = None,
+        combat_class: str = "melee",
+    ):
         self.config = config
         if profile is None:
             settings = load_profile_settings()
             profile = settings.profiles[settings.active_profile]
         self.profile = profile
+        self.combat_class = (
+            combat_class or getattr(profile, "combat_class", "melee") or "melee"
+        ).lower()
         self.templates = TemplateStore()
         self.device: Optional[InputDevice] = None
         self.vision = FrameVision(config, self.templates)
@@ -77,11 +87,18 @@ class RucoyBot:
         assert self.device is not None
         print(f"\n[+] Zone profile: '{self.profile.key}'")
         print(f"[+] Target: '{self.profile.target_name}'")
+        print(f"[+] Combat class: {self.combat_class.upper()}")
         print(f"[+] Name template: {self.profile.target_template_key}")
         print(f"[+] Minimap template: {self.profile.minimap_template_key}")
         print(f"[+] Method: {'ADB Background Tap (Free Mouse)' if self.device.use_adb else 'Win32 Click'}")
         print(f"[+] Background: {'YES (Can stay behind other windows)' if self.device.use_adb else 'Window visible'}")
         print(f"[+] Movement: Registered minimap waypoints ({'enabled' if self.config.enable_minimap_walk else 'disabled'})")
+        if self.combat_class in ("ranged", "magic"):
+            print(
+                "[+] Class auto-approach: ON (approaching mob until red mark acquired, then hold position)"
+            )
+        else:
+            print("[+] Class auto-approach: OFF (melee auto-walks in-game)")
         print(
             f"[+] Minimap alignment limits: map>={self.config.minimap_geometry_min_score:.2f}, "
             f"coverage>={self.config.minimap_min_visible_reference_fraction:.2f}, "
@@ -89,7 +106,7 @@ class RucoyBot:
             f"visible pixels>={self.config.minimap_min_visible_reference_pixels}"
         )
         print(f"[+] Hitbox Offset: {self.config.mob_body_y_offset}px below nametag (lowered for clean hits)")
-        print("[+] Target marker check: waiting for the exact marked.png outline; nearest visible Skeleton first")
+        print(f"[+] Target marker check: waiting for the exact marked.png outline; nearest visible {self.profile.target_name} first")
         print(
             f"[+] Exhaustion failsafe: {self.config.exhausted_travel_trigger_count} consecutive exhausted targets "
             f"within {self.config.exhausted_travel_window_seconds:.0f}s -> farthest minimap point, "
@@ -176,6 +193,12 @@ class RucoyBot:
             return
         if state.current_target is not None:
             self._update_target(frame, cx, cy, now)
+        if (
+            state.current_target is not None
+            and not state.confirmed_locked
+            and self.combat_class in ("ranged", "magic")
+        ):
+            self._approach_target(cx, cy, now)
         if state.current_target is None:
             idle_duration = now - state.no_target_since
             if cfg.enable_minimap_walk and idle_duration >= cfg.minimap_idle_delay and now - state.last_minimap_time >= cfg.minimap_cooldown:
@@ -465,6 +488,7 @@ class RucoyBot:
 
         if has_red and position is not None:
             state.idle_mark_check_needed = False
+            target["approached_since_tap"] = False
             if not state.confirmed_locked:
                 last_red = target.get("red_last_seen", now)
                 observations = target.get("red_observations", 0)
@@ -501,6 +525,28 @@ class RucoyBot:
             state.ignored_stale_marker = (tx, ty)
             return
 
+        # For ranged and magic classes approaching an unconfirmed target:
+        # After completing an approach step (approach_interval ground walk), tap
+        # the mob to check if it can now be locked with the red mark.
+        if (
+            self.combat_class in ("ranged", "magic")
+            and not state.confirmed_locked
+            and not has_red
+            and target.get("approached_since_tap", False)
+            and now - state.last_approach_time >= cfg.approach_interval
+        ):
+            target["approached_since_tap"] = False
+            state.target_click_time = now
+            target["approach_steps"] = target.get("approach_steps", 0) + 1
+            if self.device.click(tx, ty):
+                print(
+                    f"[+] [{self.combat_class.capitalize()}] Tapping mob at ({tx}, {ty}) "
+                    f"to acquire red mark (step #{target['approach_steps']})."
+                )
+            else:
+                print(f"[!] Target tap failed at ({tx}, {ty}); will retry.")
+            return
+
         # Keep the nearest visible Skeleton pending until its actual marker is
         # found. Retry one missed tap, then skip that nameplate briefly so the
         # bot can move on instead of waiting forever on an unmarked target.
@@ -510,34 +556,43 @@ class RucoyBot:
             not state.confirmed_locked
             and not has_red
             and state.exhausted_caption_check_at is None
-            and now - state.target_click_time >= cfg.target_entity_loss_timeout
         ):
-            retries = int(target.get("lock_retry_count", 0))
-            if retries < 1:
-                target["lock_retry_count"] = retries + 1
-                state.target_click_time = now
-                if self.device.click(tx, ty):
-                    print(
-                        f"[~] No red mark after {cfg.target_entity_loss_timeout:.1f}s; "
-                        f"retrying the target click at ({tx}, {ty})."
-                    )
-                else:
-                    print(f"[!] Target retry click failed at ({tx}, {ty}); will keep checking for its red mark.")
+            is_ranged_magic = self.combat_class in ("ranged", "magic")
+            if is_ranged_magic and target.get("approached_since_tap", False):
+                # An approach step is currently in flight; wait for it to finish.
                 return
-            ignored_position = (
-                int(target.get("nx", tx)), int(target.get("ny", ty))
-            )
-            state.unconfirmed_target_position = ignored_position
-            state.unconfirmed_target_until = now + cfg.target_entity_loss_timeout
-            print(
-                f"[!] No red mark after retry; skipping the unconfirmed target "
-                f"at {ignored_position} briefly and searching for another mob."
-            )
-            state.current_target = None
-            state.confirmed_locked = False
-            state.idle_mark_check_needed = True
-            state.no_target_since = now
-            self._reset_exhaustion_streak()
+
+            approach_exhausted = is_ranged_magic and target.get("approach_steps", 0) >= 4
+            timeout_due = now - state.target_click_time >= cfg.target_entity_loss_timeout
+
+            if approach_exhausted or timeout_due:
+                retries = int(target.get("lock_retry_count", 0))
+                if retries < 1 and not approach_exhausted:
+                    target["lock_retry_count"] = retries + 1
+                    state.target_click_time = now
+                    if self.device.click(tx, ty):
+                        print(
+                            f"[~] No red mark after {cfg.target_entity_loss_timeout:.1f}s; "
+                            f"retrying the target click at ({tx}, {ty})."
+                        )
+                    else:
+                        print(f"[!] Target retry click failed at ({tx}, {ty}); will keep checking for its red mark.")
+                    return
+                ignored_position = (
+                    int(target.get("nx", tx)), int(target.get("ny", ty))
+                )
+                state.unconfirmed_target_position = ignored_position
+                state.unconfirmed_target_until = now + cfg.target_entity_loss_timeout
+                reason = "approach steps" if approach_exhausted else "retry"
+                print(
+                    f"[!] No red mark after {reason}; skipping the unconfirmed target "
+                    f"at {ignored_position} briefly and searching for another mob."
+                )
+                state.current_target = None
+                state.confirmed_locked = False
+                state.idle_mark_check_needed = True
+                state.no_target_since = now
+                self._reset_exhaustion_streak()
 
     def _find_locked_entity(
         self, frame: np.ndarray, cx: int, cy: int, target: TargetMatch, now: float,
@@ -559,6 +614,69 @@ class RucoyBot:
         )
         distance = np.hypot(nearest["click_x"] - tx, nearest["click_y"] - ty)
         return nearest if distance <= match_radius else None
+
+    def _approach_target(self, cx: int, cy: int, now: float) -> bool:
+        """Walk closer to the targeted mob for ranged or magic classes."""
+        if self.combat_class not in ("ranged", "magic"):
+            return False
+        assert self.device is not None
+        state, cfg = self.state, self.config
+        target = state.current_target
+        if target is None:
+            return False
+
+        # Once red mark (marked.png) is locked, stop approaching immediately.
+        # Ranged and magic classes stay at distance and fight until the mob dies.
+        if state.confirmed_locked or target.get("red_observations", 0) > 0:
+            return False
+
+        # If a ground approach step was just taken, wait for the mob tap
+        # to test if the mob can now be locked with the red mark.
+        if target.get("approached_since_tap", False):
+            return False
+
+        if now - state.target_click_time < cfg.approach_initial_delay:
+            return False
+
+        if now - state.last_approach_time < cfg.approach_interval:
+            return False
+
+        tx, ty = target["click_x"], target["click_y"]
+        dx = tx - cx
+        dy = ty - cy
+        dist = float(np.hypot(dx, dy))
+
+        if dist <= cfg.approach_close_distance:
+            return False
+
+        # Calculate halfway ground tap point between player and mob,
+        # outside player deadzone and clear of mob hitbox.
+        min_step = cfg.player_deadzone_radius + 15
+        max_step = max(min_step, dist - 50)
+        fraction_step = dist * cfg.approach_step_fraction
+        step_dist = min(max_step, max(min_step, fraction_step))
+
+        ux = dx / dist
+        uy = dy / dist
+        tap_x = int(cx + ux * step_dist)
+        tap_y = int(cy + uy * step_dist)
+
+        min_x = int(1600 * cfg.margin_left)
+        max_x = int(1600 * (1 - cfg.margin_right))
+        min_y = int(900 * cfg.margin_top)
+        max_y = int(900 * (1 - cfg.margin_bottom))
+        tap_x = max(min_x, min(tap_x, max_x))
+        tap_y = max(min_y, min(tap_y, max_y))
+
+        if self.device.click(tap_x, tap_y):
+            state.last_approach_time = now
+            target["approached_since_tap"] = True
+            print(
+                f"[+] [{self.combat_class.capitalize()}] Approaching mob: tapping ground at ({tap_x}, {tap_y}) "
+                f"[dist:{int(dist)}px -> step:{int(step_dist)}px]"
+            )
+            return True
+        return False
 
     def _check_potions(self, frame: np.ndarray, now: float) -> None:
         cfg = self.config
@@ -587,6 +705,15 @@ class RucoyBot:
                 time.sleep(0.01)
             return
         display = frame.copy()
+        cv2.putText(
+            display,
+            f"Class: {self.combat_class.upper()}",
+            (10, 85),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 255),
+            1,
+        )
         cv2.circle(display, (cx, cy), self.config.player_deadzone_radius, (255, 255, 0), 1)
         if self.state.current_target is not None:
             tx, ty = self.state.current_target["click_x"], self.state.current_target["click_y"]

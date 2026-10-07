@@ -54,7 +54,7 @@ class FrameVision:
             tuple[str, tuple[int, int, int, int]], np.ndarray
         ] = {}
         self._target_template_masks: dict[
-            tuple[int, str, float], tuple[np.ndarray, np.ndarray]
+            tuple[int, str, float], tuple[Any, ...]
         ] = {}
 
     # HP/MP bar geometry at 1600x900.
@@ -322,18 +322,27 @@ class FrameVision:
             combined = scale * processing_scale
             cache_key = (id(template), name_color, combined)
             cached_template = self._target_template_masks.get(cache_key)
-            scaled = cached_template[1] if cached_template is not None else None
-            if scaled is None:
+            if cached_template is not None:
+                scaled, l_scaled, r_scaled, l_tpl_pixels, r_tpl_pixels = cached_template
+            else:
                 scaled_color = (
                     cv2.resize(template, None, fx=combined, fy=combined, interpolation=cv2.INTER_NEAREST)
                     if combined != 1.0 else template
                 )
                 scaled = mask_builder(scaled_color)
+                th, tw = scaled.shape[:2]
+                mid = tw // 2
+                l_scaled = scaled[:, :mid]
+                r_scaled = scaled[:, mid:]
+                l_tpl_pixels = np.count_nonzero(l_scaled)
+                r_tpl_pixels = np.count_nonzero(r_scaled)
                 # Target templates are immutable during a run, so avoid
                 # resizing and rebuilding their binary masks on every frame.
                 if len(self._target_template_masks) >= 32:
                     self._target_template_masks.clear()
-                self._target_template_masks[cache_key] = (template, scaled)
+                self._target_template_masks[cache_key] = (
+                    scaled, l_scaled, r_scaled, l_tpl_pixels, r_tpl_pixels
+                )
             th, tw = scaled.shape[:2]
             if th >= text_mask.shape[0] or tw >= text_mask.shape[1] or th < 3 or tw < 3:
                 return
@@ -349,6 +358,22 @@ class FrameVision:
                     or shared / observed < cfg.min_name_template_overlap
                 ):
                     continue
+
+                # Multi-segment verification: ensure both halves of the nameplate
+                # match independently. This prevents a shared prefix (such as
+                # "Skeleton" in "Skeleton Archer Lv.80") from dominating the global
+                # cross-correlation score and masking a mismatched suffix.
+                if tw >= 30 and l_tpl_pixels > 0 and r_tpl_pixels > 0:
+                    mid = tw // 2
+                    r_patch = patch[:, mid:]
+                    shared_r = np.count_nonzero(cv2.bitwise_and(r_patch, r_scaled))
+                    if shared_r / r_tpl_pixels < cfg.min_segment_template_overlap:
+                        continue
+                    l_patch = patch[:, :mid]
+                    score_l = float(cv2.matchTemplate(l_patch, l_scaled, cv2.TM_CCOEFF_NORMED)[0, 0])
+                    score_r = float(cv2.matchTemplate(r_patch, r_scaled, cv2.TM_CCOEFF_NORMED)[0, 0])
+                    if min(score_l, score_r) < cfg.min_segment_match_threshold:
+                        continue
                 x = int(round(px / processing_scale)) + scan_left
                 y = int(round(py / processing_scale)) + scan_top
                 native_w = max(1, int(round(template.shape[1] * scale)))

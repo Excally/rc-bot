@@ -14,6 +14,7 @@ class ZoneProfile:
     target_name: str
     target_template_key: str
     minimap_template_key: str
+    combat_class: str = "melee"
 
     @property
     def template_keys(self) -> tuple[str, ...]:
@@ -54,11 +55,18 @@ def load_profile_settings(path: Path = PROFILE_FILE) -> ProfileSettings:
         target_name = raw.get("target_name")
         if not isinstance(target_name, str) or not target_name.strip():
             raise ValueError(f"Profile '{key}' needs a non-empty 'target_name'.")
+        raw_combat_class = raw.get("combat_class", "melee")
+        combat_class = (
+            raw_combat_class.strip().lower()
+            if isinstance(raw_combat_class, str) and raw_combat_class.strip().lower() in {"melee", "ranged", "magic"}
+            else "melee"
+        )
         profiles[key] = ZoneProfile(
             key=key,
             target_name=target_name.strip(),
             target_template_key=_template_key(raw.get("name_template"), "name_template", key),
             minimap_template_key=_template_key(raw.get("minimap_template"), "minimap_template", key),
+            combat_class=combat_class,
         )
 
     active_profile = data.get("active_profile")
