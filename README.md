@@ -67,25 +67,31 @@ Potion parameters can be adjusted in `program/config.py`:
 
 ## Quick Start
 
-**Requirements:** Python 3.10+, BlueStacks/MSI App Player at **1600×900**, 240 DPI, 100% interface scale.
+**Requirements:** BlueStacks/MSI App Player at **1600×900**, 240 DPI, 100% interface scale.
 
+### Option A: Zero-Typing GUI Launcher (Easiest)
+Simply run `bot.py` (or double-click `bot.exe` in `release/bot.dist/`):
 ```bash
-# Install dependencies
-pip install -r requirements.txt
+python bot.py
+```
+A dark-themed launcher dialog pops up allowing you to:
+- Select your hunting zone profile from a dropdown
+- Select your combat class (**Melee**, **Ranged**, or **Magic/Mage**)
+- Click **🚀 Start Bot** with zero typing required!
 
+### Option B: Command Line (For Automation / Scripts)
+```bash
 # See available profiles
 python bot.py --list-profiles
 
-# Run the bot (defaults to melee)
-python bot.py --profile skeleton-lv75
-
-# Select combat class: melee, ranged, or magic
+# Run directly via CLI
 python bot.py --profile skeleton-lv75 melee
 python bot.py --profile skeleton-lv75 ranged
-python bot.py --profile skeleton-lv75 magic
+python bot.py --profile skeleton-lv75 magic   # or: mage
 
-# Or use the package directly
-python -m program --profile skeleton-lv75 ranged
+# Standalone Compiled Executable (No Python required)
+.\release\bot.dist\bot.exe                   # Opens GUI launcher
+.\release\bot.dist\bot.exe --profile skeleton-lv75 melee
 ```
 
 ### Combat Classes & Approach Mechanics
@@ -99,8 +105,9 @@ Press `Ctrl+C` in the terminal to stop cleanly.
 ## Architecture
 
 ```
-bot.py                  ← Entry point
+bot.py                  ← Entry point (launches GUI or CLI)
 program/
+├── gui.py              ← Graphical launcher dialog (Tkinter)
 ├── cli.py              ← Profile selection & CLI args
 ├── runner.py           ← Supervised bot restart + output watchdog
 ├── bot.py              ← Combat state machine (acquire → lock → track → release)
