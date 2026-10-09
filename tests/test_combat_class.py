@@ -44,6 +44,13 @@ class CombatClassTests(unittest.TestCase):
             mock_run.assert_called_once()
             self.assertEqual(mock_run.call_args[1]["combat_class"], "magic")
 
+    def test_cli_positional_mage_alias(self):
+        with patch("program.cli.run_bot") as mock_run:
+            result = main(["--profile", "skeleton-lv75", "mage"])
+            self.assertEqual(result, 0)
+            mock_run.assert_called_once()
+            self.assertEqual(mock_run.call_args[1]["combat_class"], "magic")
+
     def test_cli_flag_class(self):
         with patch("program.cli.run_bot") as mock_run:
             result = main(["--profile", "skeleton-lv75", "--class", "ranged"])

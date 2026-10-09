@@ -18,9 +18,11 @@ def _load_settings(parser: argparse.ArgumentParser) -> ProfileSettings:
 
 def _combat_class_arg(value: str) -> str:
     cleaned = value.strip().lower()
+    if cleaned == "mage":
+        cleaned = "magic"
     if cleaned not in {"melee", "ranged", "magic"}:
         raise argparse.ArgumentTypeError(
-            f"Invalid combat class '{value}'. Available classes: melee, ranged, magic"
+            f"Invalid combat class '{value}'. Available classes: melee, ranged, magic (or mage)"
         )
     return cleaned
 
