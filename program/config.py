@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import sys
 
 @dataclass(frozen=True)
 class BotConfig:
@@ -79,5 +80,12 @@ class BotConfig:
     approach_initial_delay: float = 0.25
 
 
+def _resolve_template_dir() -> Path:
+    exe_dir = Path(sys.executable).resolve().parent
+    if (exe_dir / "templates").is_dir():
+        return exe_dir / "templates"
+    return Path(__file__).resolve().parent.parent / "templates"
+
+
 CONFIG = BotConfig()
-TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "templates"
+TEMPLATE_DIR = _resolve_template_dir()

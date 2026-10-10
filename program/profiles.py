@@ -2,10 +2,19 @@
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-PROFILE_FILE = Path(__file__).resolve().parent.parent / "zone_profiles.json"
+
+def _resolve_profile_file() -> Path:
+    exe_dir = Path(sys.executable).resolve().parent
+    if (exe_dir / "zone_profiles.json").is_file():
+        return exe_dir / "zone_profiles.json"
+    return Path(__file__).resolve().parent.parent / "zone_profiles.json"
+
+
+PROFILE_FILE = _resolve_profile_file()
 
 
 @dataclass(frozen=True)
