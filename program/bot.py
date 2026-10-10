@@ -105,7 +105,7 @@ class RucoyBot:
             f"gap>={self.config.minimap_align_min_gap:.3f}, "
             f"visible pixels>={self.config.minimap_min_visible_reference_pixels}"
         )
-        print(f"[+] Hitbox Offset: {self.config.mob_body_y_offset}px below nametag (lowered for clean hits)")
+        print(f"[+] Hitbox Offset: {self.config.mob_body_y_offset}px below nametag (centered on mob body)")
         print(f"[+] Target marker check: waiting for the exact marked.png outline; nearest visible {self.profile.target_name} first")
         print(
             f"[+] Exhaustion failsafe: {self.config.exhausted_travel_trigger_count} consecutive exhausted targets "
@@ -602,9 +602,14 @@ class RucoyBot:
         match_radius = max(60, int(self.config.target_reacquire_radius))
         search_radius = max(150, match_radius)
         tx, ty = target["click_x"], target["click_y"]
+        search_pt = (
+            (int(target["nx"]) + int(target.get("nw", 166)) // 2, int(target["ny"]) + int(target.get("nh", 20)) // 2)
+            if "nx" in target and "ny" in target
+            else (tx, ty)
+        )
         matches = self.vision.find_targets(
             frame, self.target_templates, cx, cy,
-            search_center=(tx, ty), search_radius=search_radius, include_deadzone=True,
+            search_center=search_pt, search_radius=search_radius, include_deadzone=True,
         )
         if not matches:
             return None

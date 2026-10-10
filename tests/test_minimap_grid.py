@@ -103,7 +103,7 @@ class MinimapGridTests(unittest.TestCase):
         self.assertIsNotNone(nameplate)
         frame = np.zeros((900, 1600, 3), dtype=np.uint8)
         height, width = nameplate.shape[:2]
-        near = (800 - width // 2, 262)
+        near = (800 - width // 2, 296)
         farther = (817, 337)
         for x, y in (near, farther):
             frame[y:y + height, x:x + width] = nameplate

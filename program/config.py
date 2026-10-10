@@ -31,7 +31,7 @@ class BotConfig:
     margin_bottom: float = 0.06
     margin_left: float = 0.06
     margin_right: float = 0.06
-    mob_body_y_offset: int = 72
+    mob_body_y_offset: int = 38
     player_deadzone_radius: int = 90
     match_threshold: float = 0.60
     min_name_template_overlap: float = 0.58
