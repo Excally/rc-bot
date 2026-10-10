@@ -193,12 +193,6 @@ class RucoyBot:
             return
         if state.current_target is not None:
             self._update_target(frame, cx, cy, now)
-        if (
-            state.current_target is not None
-            and not state.confirmed_locked
-            and self.combat_class in ("ranged", "magic")
-        ):
-            self._approach_target(cx, cy, now)
         if state.current_target is None:
             idle_duration = now - state.no_target_since
             if cfg.enable_minimap_walk and idle_duration >= cfg.minimap_idle_delay and now - state.last_minimap_time >= cfg.minimap_cooldown:
@@ -434,61 +428,8 @@ class RucoyBot:
             target["click_x"], target["click_y"] = position
             tx, ty = position
             target["red_loss_since"] = None
-
-        refresh_interval = max(0.05, cfg.target_position_refresh_interval)
-        if now - target.get("last_entity_check", 0.0) >= refresh_interval:
-            target["last_entity_check"] = now
-            match = self._find_locked_entity(frame, cx, cy, target, now)
-            if match is not None:
-                target["last_entity_seen_time"] = now
-                # When the red outline flickers, keep tracking from the
-                # target's visible nameplate instead of its stale point.
-                if not has_red:
-                    target["click_x"], target["click_y"] = match["click_x"], match["click_y"]
-                    target["nx"] = match.get("nx", target.get("nx", tx))
-                    target["ny"] = match.get("ny", target.get("ny", ty))
-                    tx, ty = target["click_x"], target["click_y"]
-            elif (
-                state.confirmed_locked
-                and now - target.get("last_entity_seen_time", state.target_click_time)
-                >= cfg.target_entity_loss_timeout
-                and state.exhausted_caption_check_at is None
-            ):
-                print(
-                    f"[+] Target nameplate missing for {cfg.target_entity_loss_timeout:.1f}s; "
-                    f"releasing stale lock at ({tx}, {ty}) and searching again."
-                )
-                state.current_target = None
-                state.confirmed_locked = False
-                self._reset_exhaustion_streak()
-                state.idle_mark_check_needed = False
-                state.no_target_since = now
-                state.pickup_pending = True
-                state.ignored_stale_marker = (tx, ty)
-                return
-            elif (
-                not state.confirmed_locked
-                and not has_red
-                and now - target.get("last_entity_seen_time", state.target_click_time)
-                >= cfg.target_entity_loss_timeout
-                and state.exhausted_caption_check_at is None
-            ):
-                print(
-                    f"[+] Nearest Skeleton nameplate disappeared for "
-                    f"{cfg.target_entity_loss_timeout:.1f}s before marked.png appeared; "
-                    f"rescanning at ({tx}, {ty})."
-                )
-                state.current_target = None
-                state.confirmed_locked = False
-                self._reset_exhaustion_streak()
-                state.idle_mark_check_needed = False
-                state.no_target_since = now
-                state.ignored_stale_marker = None
-                return
-
-        if has_red and position is not None:
             state.idle_mark_check_needed = False
-            target["approached_since_tap"] = False
+
             if not state.confirmed_locked:
                 last_red = target.get("red_last_seen", now)
                 observations = target.get("red_observations", 0)
@@ -500,8 +441,10 @@ class RucoyBot:
                     return
                 state.confirmed_locked = True
                 print(f"[*] Target locked with red square! Fighting at ({tx}, {ty})...")
+            # Locked onto mob: do nothing else, never drop lock, never click ground or other mobs.
             return
 
+        # Red mark not visible in this frame.
         if state.confirmed_locked:
             loss_since = target.get("red_loss_since")
             if loss_since is None:
@@ -514,7 +457,7 @@ class RucoyBot:
                 return
             print(
                 f"[+] Red square absent for {cfg.target_red_loss_timeout:.1f}s; "
-                f"releasing target at ({tx}, {ty}) and searching again."
+                f"mob defeated at ({tx}, {ty}). Searching for next target."
             )
             state.current_target = None
             state.confirmed_locked = False
@@ -525,74 +468,67 @@ class RucoyBot:
             state.ignored_stale_marker = (tx, ty)
             return
 
-        # For ranged and magic classes approaching an unconfirmed target:
-        # After completing an approach step (approach_interval ground walk), tap
-        # the mob to check if it can now be locked with the red mark.
-        if (
-            self.combat_class in ("ranged", "magic")
-            and not state.confirmed_locked
-            and not has_red
-            and target.get("approached_since_tap", False)
-            and now - state.last_approach_time >= cfg.approach_interval
-        ):
-            target["approached_since_tap"] = False
-            state.target_click_time = now
-            target["approach_steps"] = target.get("approach_steps", 0) + 1
-            if self.device.click(tx, ty):
-                print(
-                    f"[+] [{self.combat_class.capitalize()}] Tapping mob at ({tx}, {ty}) "
-                    f"to acquire red mark (step #{target['approach_steps']})."
-                )
-            else:
-                print(f"[!] Target tap failed at ({tx}, {ty}); will retry.")
-            return
-
-        # Keep the nearest visible Skeleton pending until its actual marker is
-        # found. Retry one missed tap, then skip that nameplate briefly so the
-        # bot can move on instead of waiting forever on an unmarked target.
+        # Target was clicked, but marked.png has not appeared yet (pending confirmation).
         target["red_observations"] = 0
         target.pop("red_last_seen", None)
-        if (
-            not state.confirmed_locked
-            and not has_red
-            and state.exhausted_caption_check_at is None
-        ):
-            is_ranged_magic = self.combat_class in ("ranged", "magic")
-            if is_ranged_magic and target.get("approached_since_tap", False):
-                # An approach step is currently in flight; wait for it to finish.
-                return
+        if state.exhausted_caption_check_at is not None:
+            return
 
-            approach_exhausted = is_ranged_magic and target.get("approach_steps", 0) >= 4
-            timeout_due = now - state.target_click_time >= cfg.target_entity_loss_timeout
-
-            if approach_exhausted or timeout_due:
-                retries = int(target.get("lock_retry_count", 0))
-                if retries < 1 and not approach_exhausted:
-                    target["lock_retry_count"] = retries + 1
-                    state.target_click_time = now
-                    if self.device.click(tx, ty):
-                        print(
-                            f"[~] No red mark after {cfg.target_entity_loss_timeout:.1f}s; "
-                            f"retrying the target click at ({tx}, {ty})."
-                        )
-                    else:
-                        print(f"[!] Target retry click failed at ({tx}, {ty}); will keep checking for its red mark.")
-                    return
-                ignored_position = (
-                    int(target.get("nx", tx)), int(target.get("ny", ty))
-                )
-                state.unconfirmed_target_position = ignored_position
-                state.unconfirmed_target_until = now + cfg.target_entity_loss_timeout
-                reason = "approach steps" if approach_exhausted else "retry"
+        # Refresh entity position if nameplate is still visible while walking up to mob.
+        refresh_interval = max(0.05, cfg.target_position_refresh_interval)
+        if now - target.get("last_entity_check", 0.0) >= refresh_interval:
+            target["last_entity_check"] = now
+            match = self._find_locked_entity(frame, cx, cy, target, now)
+            if match is not None:
+                target["last_entity_seen_time"] = now
+                target["click_x"], target["click_y"] = match["click_x"], match["click_y"]
+                target["nx"] = match.get("nx", target.get("nx", tx))
+                target["ny"] = match.get("ny", target.get("ny", ty))
+                tx, ty = target["click_x"], target["click_y"]
+            elif now - target.get("last_entity_seen_time", state.target_click_time) >= cfg.target_entity_loss_timeout:
+                target_name = getattr(self.profile, "target_name", "target") if hasattr(self, "profile") else "target"
                 print(
-                    f"[!] No red mark after {reason}; skipping the unconfirmed target "
-                    f"at {ignored_position} briefly and searching for another mob."
+                    f"[+] Nearest {target_name} nameplate disappeared for "
+                    f"{cfg.target_entity_loss_timeout:.1f}s before marked.png appeared; "
+                    f"rescanning at ({tx}, {ty})."
                 )
                 state.current_target = None
                 state.confirmed_locked = False
-                state.idle_mark_check_needed = True
-                state.no_target_since = now
                 self._reset_exhaustion_streak()
+                state.idle_mark_check_needed = False
+                state.no_target_since = now
+                state.ignored_stale_marker = None
+                return
+
+        # If nameplate is still visible but red square never appeared within timeout:
+        if now - state.target_click_time >= cfg.target_entity_loss_timeout:
+            retries = int(target.get("lock_retry_count", 0))
+            if retries < 1:
+                target["lock_retry_count"] = retries + 1
+                state.target_click_time = now
+                if self.device.click(tx, ty):
+                    print(
+                        f"[~] No red mark after {cfg.target_entity_loss_timeout:.1f}s; "
+                        f"retrying the target click at ({tx}, {ty})."
+                    )
+                else:
+                    print(f"[!] Target retry click failed at ({tx}, {ty}); will keep checking for its red mark.")
+                return
+
+            ignored_position = (
+                int(target.get("nx", tx)), int(target.get("ny", ty))
+            )
+            state.unconfirmed_target_position = ignored_position
+            state.unconfirmed_target_until = now + cfg.target_entity_loss_timeout
+            print(
+                f"[!] No red mark after retry; skipping the unconfirmed target "
+                f"at {ignored_position} briefly and searching for another mob."
+            )
+            state.current_target = None
+            state.confirmed_locked = False
+            state.idle_mark_check_needed = True
+            state.no_target_since = now
+            self._reset_exhaustion_streak()
 
     def _find_locked_entity(
         self, frame: np.ndarray, cx: int, cy: int, target: TargetMatch, now: float,
@@ -620,68 +556,6 @@ class RucoyBot:
         distance = np.hypot(nearest["click_x"] - tx, nearest["click_y"] - ty)
         return nearest if distance <= match_radius else None
 
-    def _approach_target(self, cx: int, cy: int, now: float) -> bool:
-        """Walk closer to the targeted mob for ranged or magic classes."""
-        if self.combat_class not in ("ranged", "magic"):
-            return False
-        assert self.device is not None
-        state, cfg = self.state, self.config
-        target = state.current_target
-        if target is None:
-            return False
-
-        # Once red mark (marked.png) is locked, stop approaching immediately.
-        # Ranged and magic classes stay at distance and fight until the mob dies.
-        if state.confirmed_locked or target.get("red_observations", 0) > 0:
-            return False
-
-        # If a ground approach step was just taken, wait for the mob tap
-        # to test if the mob can now be locked with the red mark.
-        if target.get("approached_since_tap", False):
-            return False
-
-        if now - state.target_click_time < cfg.approach_initial_delay:
-            return False
-
-        if now - state.last_approach_time < cfg.approach_interval:
-            return False
-
-        tx, ty = target["click_x"], target["click_y"]
-        dx = tx - cx
-        dy = ty - cy
-        dist = float(np.hypot(dx, dy))
-
-        if dist <= cfg.approach_close_distance:
-            return False
-
-        # Calculate halfway ground tap point between player and mob,
-        # outside player deadzone and clear of mob hitbox.
-        min_step = cfg.player_deadzone_radius + 15
-        max_step = max(min_step, dist - 50)
-        fraction_step = dist * cfg.approach_step_fraction
-        step_dist = min(max_step, max(min_step, fraction_step))
-
-        ux = dx / dist
-        uy = dy / dist
-        tap_x = int(cx + ux * step_dist)
-        tap_y = int(cy + uy * step_dist)
-
-        min_x = int(1600 * cfg.margin_left)
-        max_x = int(1600 * (1 - cfg.margin_right))
-        min_y = int(900 * cfg.margin_top)
-        max_y = int(900 * (1 - cfg.margin_bottom))
-        tap_x = max(min_x, min(tap_x, max_x))
-        tap_y = max(min_y, min(tap_y, max_y))
-
-        if self.device.click(tap_x, tap_y):
-            state.last_approach_time = now
-            target["approached_since_tap"] = True
-            print(
-                f"[+] [{self.combat_class.capitalize()}] Approaching mob: tapping ground at ({tap_x}, {tap_y}) "
-                f"[dist:{int(dist)}px -> step:{int(step_dist)}px]"
-            )
-            return True
-        return False
 
     def _check_potions(self, frame: np.ndarray, now: float) -> None:
         cfg = self.config

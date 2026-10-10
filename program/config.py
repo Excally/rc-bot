@@ -72,12 +72,8 @@ class BotConfig:
     hp_potion_tap: tuple[int, int] = (60, 745)
     mana_potion_tap: tuple[int, int] = (60, 610)
 
-    # Combat class & auto-approach
+    # Combat class
     combat_class: str = "melee"
-    approach_close_distance: float = 100.0
-    approach_step_fraction: float = 0.5
-    approach_interval: float = 0.7
-    approach_initial_delay: float = 0.25
 
 
 def _resolve_template_dir() -> Path:
